@@ -1,5 +1,8 @@
 """Tests for scripts/hunk_review.py (stdlib unittest, no real subprocesses)."""
 
+import contextlib
+import io
+import json
 import os
 import sys
 import tempfile
@@ -59,3 +62,74 @@ class StateIOTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResolveReviewCwdTests(unittest.TestCase):
+    def test_context_cwd_wins(self):
+        ctx = {"focused_pane_cwd": "/repo/a"}
+        panes = [{"pane_id": "w1:p1", "focused": True, "cwd": "/repo/b"}]
+        self.assertEqual(hr.resolve_review_cwd(ctx, panes), "/repo/a")
+
+    def test_falls_back_to_focused_pane(self):
+        panes = [
+            {"pane_id": "w1:p1", "focused": False, "cwd": "/repo/a"},
+            {"pane_id": "w1:p2", "focused": True, "cwd": "/repo/b"},
+        ]
+        self.assertEqual(hr.resolve_review_cwd(None, panes), "/repo/b")
+        self.assertEqual(hr.resolve_review_cwd({}, panes), "/repo/b")
+
+    def test_no_focused_pane_returns_none(self):
+        panes = [{"pane_id": "w1:p1", "focused": False, "cwd": "/repo/a"}]
+        self.assertIsNone(hr.resolve_review_cwd(None, panes))
+        self.assertIsNone(hr.resolve_review_cwd(None, None))
+
+
+class OpenPickerTests(unittest.TestCase):
+    def test_context_present_opens_pane_with_context_cwd(self):
+        env = {"HERDR_PLUGIN_CONTEXT_JSON": json.dumps({"focused_pane_cwd": "/repo/a"})}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(hr, "herdr_pane_list", return_value=[]), \
+             mock.patch.object(hr, "run_herdr", return_value="") as run:
+            rc = hr.cmd_open_picker([])
+        self.assertEqual(rc, 0)
+        run.assert_called_once_with(
+            "plugin", "pane", "open",
+            "--plugin", "herdr-hunk-review",
+            "--entrypoint", "picker",
+            "--placement", "split",
+            "--direction", "right",
+            "--cwd", "/repo/a",
+            "--focus",
+        )
+
+    def test_no_context_falls_back_to_pane_list(self):
+        panes = [{"pane_id": "w1:p2", "focused": True, "cwd": "/repo/b"}]
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONTEXT_JSON": ""}), \
+             mock.patch.object(hr, "herdr_pane_list", return_value=panes), \
+             mock.patch.object(hr, "run_herdr", return_value="") as run:
+            rc = hr.cmd_open_picker([])
+        self.assertEqual(rc, 0)
+        args = run.call_args[0]
+        self.assertEqual(args[args.index("--cwd") + 1], "/repo/b")
+
+    def test_unresolvable_cwd_notifies_and_fails(self):
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_CONTEXT_JSON": ""}), \
+             mock.patch.object(hr, "herdr_pane_list", return_value=None), \
+             mock.patch.object(hr, "run_herdr", return_value="") as run, \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc = hr.cmd_open_picker([])
+        self.assertEqual(rc, 1)
+        self.assertEqual(run.call_args[0][0], "notification")
+        self.assertEqual(run.call_args[0][1], "show")
+
+
+class PickerGuardTests(unittest.TestCase):
+    def test_non_repo_prints_message_waits_and_exits_zero(self):
+        buf = io.StringIO()
+        with mock.patch.object(hr, "run_git", return_value=None), \
+             mock.patch.object(hr, "wait_for_keypress") as wait, \
+             contextlib.redirect_stdout(buf):
+            rc = hr.cmd_picker([])
+        self.assertEqual(rc, 0)
+        self.assertIn("not a git repository", buf.getvalue())
+        wait.assert_called_once()

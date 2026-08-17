@@ -15,8 +15,8 @@ read_when:
 
 ## Phase 2: Picker entry (REQ-001)
 
-- [ ] T004 [REQ-001] Implement `open-picker` action (DEC-004): pure `resolve_review_cwd(context_json, pane_list)` reading `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_cwd` with `herdr pane list` focused-pane fallback; then `herdr plugin pane open --plugin herdr-hunk-review --entrypoint picker --placement split --direction right --cwd <cwd> --focus`; failures → `herdr notification show` + stderr (DEC-011). Tests cover context-present and fallback paths. Verify: `python3 -m unittest discover -s tests` → GREEN
-- [ ] T005 [REQ-001] Implement picker startup guard: normalize cwd via `git rev-parse --show-toplevel`; non-repo → print `not a git repository`, wait for one keypress — tty: raw single-byte read via `termios`/`tty` cbreak with restore in `finally`; non-tty: `readline()` — then exit 0 (AC-002, DEC-011). Verify: `cd /tmp && printf '\n' | python3 ~/Developer/ohlulu/herdr-hunk-review/scripts/hunk_review.py picker | grep -q 'not a git repository'` → exit 0
+- [x] T004 [REQ-001] Implement `open-picker` action (DEC-004): pure `resolve_review_cwd(context_json, pane_list)` reading `HERDR_PLUGIN_CONTEXT_JSON.focused_pane_cwd` with `herdr pane list` focused-pane fallback; then `herdr plugin pane open --plugin herdr-hunk-review --entrypoint picker --placement split --direction right --cwd <cwd> --focus`; failures → `herdr notification show` + stderr (DEC-011). Tests cover context-present and fallback paths. Verify: `python3 -m unittest discover -s tests` → GREEN
+- [x] T005 [REQ-001] Implement picker startup guard: normalize cwd via `git rev-parse --show-toplevel`; non-repo → print `not a git repository`, wait for one keypress — tty: raw single-byte read via `termios`/`tty` cbreak with restore in `finally`; non-tty: `readline()` — then exit 0 (AC-002, DEC-011). Verify: `cd /tmp && printf '\n' | python3 ~/Developer/ohlulu/herdr-hunk-review/scripts/hunk_review.py picker | grep -q 'not a git repository'` → exit 0
 
 ## Phase 3: Menu + base resolution (REQ-002, REQ-003)
 
