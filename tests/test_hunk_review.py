@@ -1,6 +1,7 @@
 """Tests for scripts/hunk_review.py (stdlib unittest, no real subprocesses)."""
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -643,6 +644,26 @@ class SendNotesTests(StateDirTestCase):
         )
         notifications2 = [c[3] for c in record2 if c[:3] == ("herdr", "notification", "show")]
         self.assertIn("No new notes to send", notifications2)
+
+    def test_concurrent_send_blocked_by_lock(self):
+        # Race guard: a second invocation while one holds the claim must not
+        # prompt the agent a second time.
+        holder = open(self.state_dir / "send.lock", "w")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
+        rc = self.run_send(record, herdr, hunk)
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
+        )
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(any("already in progress" in n for n in notifications))
+        # Nothing was marked: the notes stay claimable by the lock holder.
+        self.assertEqual(hr.read_json_state("sent.json", {}), {})
 
     def test_ambiguous_agents_notification_lists_candidates(self):
         # AC-013 at the orchestration layer.

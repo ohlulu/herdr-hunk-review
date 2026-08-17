@@ -13,6 +13,7 @@ take injected runner callables; subprocess glue stays thin so tests never
 shell out to real herdr/git/hunk.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -25,6 +26,7 @@ USAGE = "usage: hunk_review.py {open-picker|picker|send-notes}"
 
 PANES_STATE = "panes.json"  # repo root -> viewer pane id (written on exec only)
 SENT_STATE = "sent.json"  # hunk session id -> [delivered noteId, ...]
+SEND_LOCK = "send.lock"  # cross-process claim for the whole send flow
 
 # ---------------------------------------------------------------------------
 # State IO (JSON files under HERDR_PLUGIN_STATE_DIR, atomic temp + rename)
@@ -551,6 +553,23 @@ def resolve_agent_for(focused_pane, repo):
     )
 
 
+def acquire_send_lock():
+    """Claim the send flow across processes, or None when already claimed.
+
+    The duplicate guard is read sent.json -> prompt -> write sent.json; two
+    overlapping invocations racing that window would each deliver the same
+    notes. flock serializes the whole flow and releases on process exit, so
+    a crashed sender never wedges the next one. The caller must keep the
+    returned file object referenced while sending."""
+    handle = open(state_dir() / SEND_LOCK, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def cmd_send_notes(args):
     """Action: deliver unsent user hunk notes to the resolved agent pane
     (REQ-006..008, DEC-008..011)."""
@@ -577,6 +596,11 @@ def cmd_send_notes(args):
     if not session_id:
         # AC-011: without a live session there is nothing to collect.
         return fail_action(f"hunk-review: no live hunk session for {repo}")
+
+    send_lock = acquire_send_lock()  # held (referenced) until process exit
+    if send_lock is None:
+        run_herdr("notification", "show", "hunk-review: send already in progress")
+        return 1
 
     out = run_hunk(
         "session", "comment", "list", "--repo", repo, "--type", "user", "--json"
