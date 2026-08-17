@@ -1,8 +1,8 @@
 # herdr-hunk-review
 
-A [herdr](https://github.com/herdr-dev/herdr) plugin that turns code review into a
+A [herdr](https://herdr.dev) plugin that turns code review into a
 two-key loop: `cmd+shift+h` opens a picker pane that becomes a
-[hunk](https://github.com/jesseduffield/hunk) diff viewer for the target you choose;
+[hunk](https://hunk.dev/) diff viewer for the target you choose;
 `cmd+shift+s` sends every inline note you wrote in hunk to the agent pane sitting
 next to it, as one prompt, and clears them from the viewer.
 
