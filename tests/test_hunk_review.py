@@ -470,3 +470,193 @@ class FormatPromptTests(unittest.TestCase):
             }
         ]
         self.assertIn("- a.py:3 — First line.\nSecond line.", hr.format_prompt("/r", notes))
+
+
+class FilterUnsentTests(unittest.TestCase):
+    NOTES = [
+        {"noteId": "n1", "filePath": "a.py", "oldRange": None, "newRange": [1, 2], "body": "x"},
+        {"noteId": "n2", "filePath": "b.py", "oldRange": [3, 3], "newRange": None, "body": "y"},
+    ]
+
+    def test_excludes_recorded_ids(self):
+        self.assertEqual(hr.filter_unsent(self.NOTES, ["n1"]), [self.NOTES[1]])
+
+    def test_empty_sent_keeps_all(self):
+        self.assertEqual(hr.filter_unsent(self.NOTES, []), self.NOTES)
+        self.assertEqual(hr.filter_unsent(self.NOTES, None), self.NOTES)
+
+    def test_gc_drops_dead_sessions(self):
+        sent = {"sess-live": ["n1"], "sess-dead": ["n2"]}
+        self.assertEqual(
+            hr.gc_sent(sent, ["sess-live"]), {"sess-live": ["n1"]}
+        )
+        self.assertEqual(hr.gc_sent(sent, []), {})
+
+
+def make_fake_herdr(record, agents, neighbors, prompt_ok=True):
+    """Low-level run_herdr fake emitting the observed CLI envelopes."""
+
+    def herdr(*args):
+        record.append(("herdr",) + args)
+        if args[:2] == ("agent", "list"):
+            return json.dumps({"result": {"agents": agents, "type": "agent_list"}})
+        if args[:2] == ("pane", "neighbor"):
+            direction = args[args.index("--direction") + 1]
+            neighbor = {"pane_id": args[args.index("--pane") + 1]}
+            if neighbors.get(direction):
+                neighbor["neighbor_pane_id"] = neighbors[direction]
+            return json.dumps(
+                {"result": {"neighbor": neighbor, "type": "pane_neighbor"}}
+            )
+        if args[:2] == ("agent", "prompt"):
+            return "" if prompt_ok else None
+        if args[:2] == ("notification", "show"):
+            return ""
+        return ""
+
+    return herdr
+
+
+def make_fake_hunk(record, session_id, comments, rm_fail=(), rm_snapshots=None):
+    """Low-level run_hunk fake emitting full Hunk 0.18 envelopes (DEC-008)."""
+
+    def hunk(*args):
+        record.append(("hunk",) + args)
+        if args[:2] == ("session", "get"):
+            if session_id is None:
+                return None  # observed: rc=1 + stderr when no live session
+            return json.dumps({"session": {"sessionId": session_id}})
+        if args[:3] == ("session", "comment", "list"):
+            return json.dumps({"comments": comments})
+        if args[:3] == ("session", "comment", "rm"):
+            if rm_snapshots is not None:
+                rm_snapshots.append(hr.read_json_state("sent.json", {}))
+            return None if args[-1] in rm_fail else "{}"
+        if args[:2] == ("session", "list"):
+            sessions = [] if session_id is None else [{"sessionId": session_id}]
+            return json.dumps({"sessions": sessions})
+        return ""
+
+    return hunk
+
+
+class SendNotesTests(StateDirTestCase):
+    PANES = [
+        {"pane_id": "w1:pHUNK", "tab_id": "w1:t1", "cwd": "/repo", "focused": True},
+        {"pane_id": "w1:pAGENT", "tab_id": "w1:t1", "cwd": "/repo", "focused": False},
+    ]
+    AGENTS = [{"pane_id": "w1:pAGENT", "tab_id": "w1:t1", "cwd": "/repo"}]
+    COMMENTS = [
+        {"noteId": "n1", "filePath": "src/app.py", "oldRange": [10, 12], "newRange": [11, 13], "body": "Rename this."},
+        {"noteId": "n2", "filePath": "README.md", "oldRange": None, "newRange": None, "body": "Tighten intro."},
+    ]
+
+    @staticmethod
+    def fake_git(*args):
+        if args[:1] == ("-C",) and args[2:] == ("rev-parse", "--show-toplevel"):
+            return "/repo" if args[1].startswith("/repo") else None
+        return None
+
+    def run_send(self, record, herdr, hunk):
+        with mock.patch.object(hr, "herdr_pane_list", return_value=self.PANES), \
+             mock.patch.object(hr, "run_herdr", herdr), \
+             mock.patch.object(hr, "run_hunk", hunk), \
+             mock.patch.object(hr, "run_git", self.fake_git), \
+             contextlib.redirect_stderr(io.StringIO()):
+            return hr.cmd_send_notes([])
+
+    def test_happy_path_prompt_mark_rm_order(self):
+        # AC-009 + pinned call order prompt -> mark -> rm.
+        record = []
+        rm_snapshots = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        hunk = make_fake_hunk(
+            record, "sess-1", self.COMMENTS, rm_snapshots=rm_snapshots
+        )
+        rc = self.run_send(record, herdr, hunk)
+        self.assertEqual(rc, 0)
+
+        prompt_calls = [c for c in record if c[:3] == ("herdr", "agent", "prompt")]
+        self.assertEqual(len(prompt_calls), 1)
+        self.assertEqual(prompt_calls[0][3], "w1:pAGENT")
+        self.assertIn("- src/app.py:11 — Rename this.", prompt_calls[0][4])
+        self.assertIn("- README.md — Tighten intro.", prompt_calls[0][4])
+        self.assertNotIn("--wait", prompt_calls[0])
+
+        rm_calls = [c for c in record if c[:4] == ("hunk", "session", "comment", "rm")]
+        self.assertEqual([c[-1] for c in rm_calls], ["n1", "n2"])
+        # Marking happened before every rm (AC-014 guard).
+        for snapshot in rm_snapshots:
+            self.assertEqual(snapshot.get("sess-1"), ["n1", "n2"])
+        # prompt strictly precedes rm in the recorded call sequence.
+        self.assertLess(
+            record.index(prompt_calls[0]), record.index(rm_calls[0])
+        )
+
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertIn("Sent 2 note(s) to w1:pAGENT", notifications)
+
+    def test_no_session_notifies_and_skips_prompt(self):
+        # AC-011.
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {})
+        hunk = make_fake_hunk(record, None, [])
+        rc = self.run_send(record, herdr, hunk)
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
+        )
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(any("no live hunk session" in n for n in notifications))
+
+    def test_all_sent_notifies_no_new_notes(self):
+        # AC-010.
+        hr.write_json_state("sent.json", {"sess-1": ["n1", "n2"]})
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
+        rc = self.run_send(record, herdr, hunk)
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
+        )
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertIn("No new notes to send", notifications)
+
+    def test_failed_rm_still_marked_second_run_sends_nothing(self):
+        # AC-014: rm failure -> note remains in hunk but is never re-delivered.
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS, rm_fail={"n1", "n2"})
+        self.assertEqual(self.run_send(record, herdr, hunk), 0)
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(any("failed to remove 2 note(s)" in n for n in notifications))
+
+        record2 = []
+        herdr2 = make_fake_herdr(record2, self.AGENTS, {"left": "w1:pAGENT"})
+        hunk2 = make_fake_hunk(record2, "sess-1", self.COMMENTS)
+        self.assertEqual(self.run_send(record2, herdr2, hunk2), 0)
+        self.assertEqual(
+            [c for c in record2 if c[:3] == ("herdr", "agent", "prompt")], []
+        )
+        notifications2 = [c[3] for c in record2 if c[:3] == ("herdr", "notification", "show")]
+        self.assertIn("No new notes to send", notifications2)
+
+    def test_ambiguous_agents_notification_lists_candidates(self):
+        # AC-013 at the orchestration layer.
+        agents = [
+            {"pane_id": "w1:pA1", "tab_id": "w1:t1", "cwd": "/repo"},
+            {"pane_id": "w1:pA2", "tab_id": "w1:t1", "cwd": "/repo/sub"},
+        ]
+        record = []
+        herdr = make_fake_herdr(record, agents, {})
+        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
+        rc = self.run_send(record, herdr, hunk)
+        self.assertEqual(rc, 1)
+        self.assertEqual(
+            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
+        )
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(
+            any("w1:pA1" in n and "w1:pA2" in n for n in notifications)
+        )

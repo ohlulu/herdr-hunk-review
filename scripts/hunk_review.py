@@ -24,6 +24,7 @@ from pathlib import Path
 USAGE = "usage: hunk_review.py {open-picker|picker|send-notes}"
 
 PANES_STATE = "panes.json"  # repo root -> viewer pane id (written on exec only)
+SENT_STATE = "sent.json"  # hunk session id -> [delivered noteId, ...]
 
 # ---------------------------------------------------------------------------
 # State IO (JSON files under HERDR_PLUGIN_STATE_DIR, atomic temp + rename)
@@ -503,9 +504,131 @@ def cmd_picker(args):
     return launch_viewer(repo, exec_argv, reload_args)
 
 
+def filter_unsent(notes, sent_ids):
+    """Notes whose noteId has not been delivered yet (AC-014)."""
+    sent = set(sent_ids or [])
+    return [note for note in notes if note.get("noteId") not in sent]
+
+
+def gc_sent(sent, live_session_ids):
+    """Drop sent entries whose hunk session no longer exists (DEC-008)."""
+    live = set(live_session_ids or [])
+    return {sid: ids for sid, ids in sent.items() if sid in live}
+
+
+def hunk_live_session_ids():
+    """Session ids from `hunk session list --json`, or None on failure."""
+    out = run_hunk("session", "list", "--json")
+    if out is None:
+        return None
+    try:
+        return [s.get("sessionId") for s in json.loads(out)["sessions"]]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def resolve_agent_for(focused_pane, repo):
+    """Glue: gather herdr data + repo roots, then run resolve_agent (DEC-009)."""
+    agents = herdr_agent_list() or []
+    pane_id = focused_pane.get("pane_id")
+    directions = ("left", "right", "up", "down")
+    neighbor_ids = (
+        [herdr_neighbor_id(pane_id, d) for d in directions] if pane_id else []
+    )
+
+    def repo_root_of(cwd):
+        if not cwd:
+            return None
+        return run_git("-C", cwd, "rev-parse", "--show-toplevel")
+
+    return resolve_agent(
+        pane_id, focused_pane.get("tab_id"), agents, neighbor_ids, repo, repo_root_of
+    )
+
+
 def cmd_send_notes(args):
-    print("send-notes: not implemented yet", file=sys.stderr)
-    return 1
+    """Action: deliver unsent user hunk notes to the resolved agent pane
+    (REQ-006..008, DEC-008..011)."""
+    focused = None
+    for pane in herdr_pane_list() or []:
+        if pane.get("focused"):
+            focused = pane
+            break
+    if focused is None:
+        return fail_action("hunk-review: cannot determine focused pane")
+
+    cwd = focused.get("cwd")
+    repo = run_git("-C", cwd, "rev-parse", "--show-toplevel") if cwd else None
+    if repo is None:
+        return fail_action("hunk-review: focused pane is not in a git repository")
+
+    out = run_hunk("session", "get", "--repo", repo, "--json")
+    session_id = None
+    if out is not None:
+        try:
+            session_id = json.loads(out)["session"]["sessionId"]
+        except (ValueError, KeyError, TypeError):
+            session_id = None
+    if not session_id:
+        # AC-011: without a live session there is nothing to collect.
+        return fail_action(f"hunk-review: no live hunk session for {repo}")
+
+    out = run_hunk(
+        "session", "comment", "list", "--repo", repo, "--type", "user", "--json"
+    )
+    if out is None:
+        return fail_action("hunk-review: failed to list hunk notes")
+    try:
+        notes = json.loads(out)["comments"]
+    except (ValueError, KeyError, TypeError):
+        return fail_action("hunk-review: unexpected hunk comment list output")
+
+    sent = read_json_state(SENT_STATE, {})
+    unsent = filter_unsent(notes, sent.get(session_id, []))
+    if not unsent:
+        run_herdr("notification", "show", "No new notes to send")  # AC-010
+        return 0
+
+    agent_pane, candidates = resolve_agent_for(focused, repo)
+    if agent_pane is None:
+        if candidates:
+            return fail_action(
+                "hunk-review: multiple agent panes match: "
+                + ", ".join(candidates)
+                + " — focus next to the target agent and retry"
+            )
+        return fail_action("hunk-review: no agent pane found")
+
+    prompt = format_prompt(repo, unsent)
+    # No --wait: fire-and-forget so the action returns immediately (DEC-009).
+    if run_herdr("agent", "prompt", agent_pane, prompt) is None:
+        return fail_action("hunk-review: failed to prompt agent")
+
+    # Mark BEFORE comment rm: if rm fails the note stays visible in hunk but
+    # must never be delivered twice (AC-014).
+    delivered = [note.get("noteId") for note in unsent]
+    sent.setdefault(session_id, []).extend(delivered)
+    live = hunk_live_session_ids()
+    if live is not None:
+        # Keep the current session even if the list read races the daemon.
+        sent = gc_sent(sent, set(live) | {session_id})
+    write_json_state(SENT_STATE, sent)
+
+    failed_rm = [
+        note_id
+        for note_id in delivered
+        if run_hunk("session", "comment", "rm", "--repo", repo, note_id) is None
+    ]
+    if failed_rm:
+        # Notify only; the sent-id record already guards against re-delivery.
+        run_herdr(
+            "notification",
+            "show",
+            f"hunk-review: failed to remove {len(failed_rm)} note(s) from hunk",
+        )
+
+    run_herdr("notification", "show", f"Sent {len(unsent)} note(s) to {agent_pane}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
