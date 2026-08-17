@@ -347,3 +347,126 @@ class LaunchViewerTests(StateDirTestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(herdr_calls, [])
+
+
+class ResolveAgentTests(unittest.TestCase):
+    AGENTS = [
+        {"pane_id": "w1:pA", "tab_id": "w1:t1", "cwd": "/repo"},
+        {"pane_id": "w1:pB", "tab_id": "w1:t1", "cwd": "/repo/sub"},
+        {"pane_id": "w1:pX", "tab_id": "w1:t2", "cwd": "/repo"},
+    ]
+
+    @staticmethod
+    def repo_root_of(cwd):
+        roots = {"/repo": "/repo", "/repo/sub": "/repo", "/elsewhere": "/elsewhere"}
+        return roots.get(cwd)
+
+    def test_focused_agent_pane_wins(self):
+        pane, candidates = hr.resolve_agent(
+            "w1:pA", "w1:t1", self.AGENTS, [], "/repo", self.repo_root_of
+        )
+        self.assertEqual(pane, "w1:pA")
+        self.assertEqual(candidates, [])
+
+    def test_left_neighbor_agent_wins(self):
+        # AC-012: focused hunk pane, agent to the left.
+        pane, candidates = hr.resolve_agent(
+            "w1:pHUNK",
+            "w1:t1",
+            self.AGENTS,
+            ["w1:pA", None, None, None],  # left/right/up/down probe order
+            "/repo",
+            self.repo_root_of,
+        )
+        self.assertEqual(pane, "w1:pA")
+
+    def test_non_agent_neighbor_skipped_unique_same_repo_wins(self):
+        pane, candidates = hr.resolve_agent(
+            "w2:pHUNK",
+            "w1:t2",
+            self.AGENTS,
+            ["w2:pNVIM", None, None, None],  # neighbor exists but is no agent
+            "/repo",
+            self.repo_root_of,
+        )
+        self.assertEqual(pane, "w1:pX")  # only same-tab same-repo agent
+        self.assertEqual(candidates, [])
+
+    def test_two_same_repo_agents_fail_with_candidates(self):
+        # AC-013: no agent neighbor, two same-repo agents in the tab.
+        pane, candidates = hr.resolve_agent(
+            "w1:pHUNK", "w1:t1", self.AGENTS, [None, None, None, None],
+            "/repo", self.repo_root_of,
+        )
+        self.assertIsNone(pane)
+        self.assertEqual(candidates, ["w1:pA", "w1:pB"])
+
+    def test_no_agents_anywhere_fails_empty(self):
+        pane, candidates = hr.resolve_agent(
+            "w1:pHUNK", "w1:t1", [], [None, None, None, None],
+            "/repo", self.repo_root_of,
+        )
+        self.assertIsNone(pane)
+        self.assertEqual(candidates, [])
+
+
+class FormatPromptTests(unittest.TestCase):
+    def test_line_prefers_new_range(self):
+        notes = [
+            {
+                "noteId": "n1",
+                "filePath": "src/app.py",
+                "oldRange": [10, 12],
+                "newRange": [11, 13],
+                "body": "Rename this.",
+            }
+        ]
+        prompt = hr.format_prompt("/repo", notes)
+        self.assertIn("- src/app.py:11 — Rename this.", prompt)
+        self.assertTrue(
+            prompt.startswith(
+                "Human inline review comments on your changes in /repo:\n\n"
+            )
+        )
+        self.assertTrue(
+            prompt.endswith(
+                "Address each comment and verify the result. "
+                "If a comment is unclear, ask a focused question before proceeding."
+            )
+        )
+
+    def test_line_falls_back_to_old_range(self):
+        notes = [
+            {
+                "noteId": "n2",
+                "filePath": "lib/util.py",
+                "oldRange": [7, 7],
+                "newRange": None,
+                "body": "Why removed?",
+            }
+        ]
+        self.assertIn("- lib/util.py:7 — Why removed?", hr.format_prompt("/r", notes))
+
+    def test_no_ranges_omits_line_suffix(self):
+        notes = [
+            {
+                "noteId": "n3",
+                "filePath": "README.md",
+                "oldRange": None,
+                "newRange": None,
+                "body": "General: tighten intro.",
+            }
+        ]
+        self.assertIn("- README.md — General: tighten intro.", hr.format_prompt("/r", notes))
+
+    def test_multiline_body_verbatim(self):
+        notes = [
+            {
+                "noteId": "n4",
+                "filePath": "a.py",
+                "oldRange": None,
+                "newRange": [3, 4],
+                "body": "First line.\nSecond line.",
+            }
+        ]
+        self.assertIn("- a.py:3 — First line.\nSecond line.", hr.format_prompt("/r", notes))

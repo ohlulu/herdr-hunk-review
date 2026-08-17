@@ -111,6 +111,30 @@ def herdr_pane_list():
         return None
 
 
+def herdr_agent_list():
+    """Agents array from `herdr agent list`, or None when herdr is unreachable."""
+    out = run_herdr("agent", "list")
+    if out is None:
+        return None
+    try:
+        return json.loads(out)["result"]["agents"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def herdr_neighbor_id(pane_id, direction):
+    """Neighbor pane id in one direction, or None (no neighbor / error)."""
+    out = run_herdr("pane", "neighbor", "--direction", direction, "--pane", pane_id)
+    if out is None:
+        return None
+    try:
+        # Without a neighbor the envelope still returns rc 0 but omits
+        # neighbor_pane_id, so .get() is the whole no-neighbor handling.
+        return json.loads(out)["result"]["neighbor"].get("neighbor_pane_id")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def fail_action(message):
     """DEC-011: action-layer failure -> notification + stderr, exit 1."""
     print(message, file=sys.stderr)
@@ -199,6 +223,54 @@ def target_argv(key, base=None, sha=None, old=None, new=None, compare=None):
         spec = f"{base}...{compare}"
         return ["hunk", "diff", spec], ["diff", spec]
     raise ValueError(f"unknown target: {key}")
+
+
+def resolve_agent(focused_pane_id, focused_tab_id, agent_panes, neighbor_ids, repo, repo_root_of):
+    """DEC-009 agent resolution -> (pane_id, []) or (None, candidate_ids).
+
+    agent_panes: entries from `herdr agent list` (pane_id / tab_id / cwd).
+    neighbor_ids: neighbor pane ids in probe order left/right/up/down;
+    None entries (no neighbor) are skipped.
+    repo_root_of: injected cwd -> repo-root resolver (None when not a repo)."""
+    agent_ids = {p.get("pane_id") for p in agent_panes or []}
+    if focused_pane_id in agent_ids:
+        return focused_pane_id, []
+    for neighbor in neighbor_ids or []:
+        if neighbor and neighbor in agent_ids:
+            return neighbor, []
+    candidates = [
+        p["pane_id"]
+        for p in agent_panes or []
+        if p.get("tab_id") == focused_tab_id and repo_root_of(p.get("cwd")) == repo
+    ]
+    if len(candidates) == 1:
+        return candidates[0], []
+    return None, candidates
+
+
+def format_prompt(worktree, notes):
+    """DEC-010 fixed English template; one `filePath:line — body` row per note.
+
+    Line number prefers newRange[0], falls back to oldRange[0], else the
+    `:line` suffix is omitted. Multi-line bodies pass through verbatim."""
+    lines = [f"Human inline review comments on your changes in {worktree}:", ""]
+    for note in notes:
+        location = note.get("filePath", "")
+        line_no = None
+        for range_key in ("newRange", "oldRange"):
+            rng = note.get(range_key)
+            if rng:
+                line_no = rng[0]
+                break
+        if line_no is not None:
+            location = f"{location}:{line_no}"
+        lines.append(f"- {location} — {note.get('body', '')}")
+    lines.append("")
+    lines.append(
+        "Address each comment and verify the result. "
+        "If a comment is unclear, ask a focused question before proceeding."
+    )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
