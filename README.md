@@ -13,13 +13,21 @@ Single stdlib-only Python script, no build step.
 Requires herdr ≥ 0.8, hunk ≥ 0.18, fzf, git, and python3 ≥ 3.9 on `PATH`.
 
 ```sh
+herdr plugin install ohlulu/herdr-hunk-review
+```
+
+herdr fetches the repo, pins the commit, and keeps its own copy; re-run the
+command to upgrade (or pin a version with `--ref`).
+
+For development, link a checkout instead — nothing is copied, edits are live,
+and `git pull` is the whole upgrade story:
+
+```sh
 git clone https://github.com/ohlulu/herdr-hunk-review
 herdr plugin link ./herdr-hunk-review
 ```
 
-`herdr plugin list` should now show `herdr-hunk-review`. The link registers
-the checkout by path — nothing is copied, so `git pull` is the whole upgrade
-story.
+Either way `herdr plugin list` should now show `herdr-hunk-review`.
 
 ## Keybindings
 
