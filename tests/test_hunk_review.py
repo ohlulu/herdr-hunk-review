@@ -5,6 +5,7 @@ import fcntl
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -258,6 +259,58 @@ class TargetArgvTests(unittest.TestCase):
     def test_unknown_target_raises(self):
         with self.assertRaises(ValueError):
             hr.target_argv("bogus")
+
+
+class RunFzfTests(unittest.TestCase):
+    @staticmethod
+    def _proc(returncode, stdout=""):
+        return subprocess.CompletedProcess(
+            args=["fzf"], returncode=returncode, stdout=stdout
+        )
+
+    def test_cancel_codes_return_none(self):
+        for returncode in (1, 130):
+            with self.subTest(returncode=returncode):
+                with mock.patch.object(
+                    hr.subprocess, "run", return_value=self._proc(returncode)
+                ):
+                    self.assertIsNone(hr.run_fzf(["a", "b"]))
+
+    def test_selection_passes_through(self):
+        with mock.patch.object(
+            hr.subprocess, "run", return_value=self._proc(0, "picked\n")
+        ):
+            self.assertEqual(hr.run_fzf(["picked", "other"]), "picked")
+
+    def test_unexpected_exit_raises(self):
+        with mock.patch.object(hr.subprocess, "run", return_value=self._proc(2)):
+            with self.assertRaises(RuntimeError):
+                hr.run_fzf(["a"])
+
+    def test_missing_binary_raises(self):
+        with mock.patch.object(
+            hr.subprocess, "run", side_effect=FileNotFoundError("fzf")
+        ):
+            with self.assertRaises(RuntimeError):
+                hr.run_fzf(["a"])
+
+
+class PickerFzfErrorTests(unittest.TestCase):
+    def test_picker_surfaces_fzf_error_and_waits(self):
+        # A broken fzf must not masquerade as Esc: message + keypress + rc 1.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        buf = io.StringIO()
+        with mock.patch.object(hr, "run_git", return_value=tmp.name), \
+             mock.patch.object(
+                 hr, "run_fzf", side_effect=RuntimeError("fzf failed to start: boom")
+             ), \
+             mock.patch.object(hr, "wait_for_keypress") as wait, \
+             contextlib.redirect_stdout(buf):
+            rc = hr.cmd_picker([])
+        self.assertEqual(rc, 1)
+        self.assertIn("fzf failed to start", buf.getvalue())
+        wait.assert_called_once()
 
 
 class PickRangeTests(unittest.TestCase):

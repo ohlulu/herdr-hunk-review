@@ -314,8 +314,10 @@ def strip_ansi(text):
 def run_fzf(lines, *fzf_args):
     """Run fzf over lines (UI renders on /dev/tty even with stdio piped).
 
-    Returns selection stdout (multi-select: newline-joined) or None on
-    cancel/Esc — fzf exits 130 on Esc, 1 on no match."""
+    Returns selection stdout (multi-select: newline-joined) or None on user
+    cancel — fzf exits 130 on Esc/interrupt, 1 on no match. Anything else
+    (missing binary, permission, unexpected status) raises RuntimeError so
+    callers surface it instead of miming a cancel (DEC-011 fail-fast)."""
     try:
         proc = subprocess.run(
             ["fzf", *fzf_args],
@@ -323,10 +325,12 @@ def run_fzf(lines, *fzf_args):
             stdout=subprocess.PIPE,
             text=True,
         )
-    except OSError:
+    except OSError as error:
+        raise RuntimeError(f"fzf failed to start: {error}")
+    if proc.returncode in (1, 130):
         return None
     if proc.returncode != 0:
-        return None
+        raise RuntimeError(f"fzf exited with status {proc.returncode}")
     out = proc.stdout.strip("\n")
     return out if out else None
 
@@ -494,17 +498,24 @@ def cmd_picker(args):
         wait_for_keypress()
         return 0
     os.chdir(repo)
-    base = resolve_base(run_git)
-    menu = build_menu(base)
-    # --layout=reverse renders input order top-down with the cursor on the
-    # first row, matching REQ-002's menu order + default selection.
-    label = run_fzf([label for _, label in menu], "--layout=reverse")
-    if label is None:
-        return 0  # Esc: close the pane with no residue (AC-003).
-    key = {lbl: k for k, lbl in menu}.get(label)
-    if key is None:
-        return 0
-    selection = pick_target(key, base)
+    try:
+        base = resolve_base(run_git)
+        menu = build_menu(base)
+        # --layout=reverse renders input order top-down with the cursor on the
+        # first row, matching REQ-002's menu order + default selection.
+        label = run_fzf([label for _, label in menu], "--layout=reverse")
+        if label is None:
+            return 0  # Esc: close the pane with no residue (AC-003).
+        key = {lbl: k for k, lbl in menu}.get(label)
+        if key is None:
+            return 0
+        selection = pick_target(key, base)
+    except RuntimeError as error:
+        # Dependency/execution failure is not a cancel: show it, let the
+        # human read it, then close (DEC-011).
+        print(error)
+        wait_for_keypress()
+        return 1
     if selection is None:
         return 0  # Esc in any sub-picker also closes cleanly (DEC-006).
     exec_argv, reload_args = selection
