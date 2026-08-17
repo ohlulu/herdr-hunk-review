@@ -67,10 +67,6 @@ class StateIOTests(StateDirTestCase):
         self.assertEqual(os.listdir(self.state_dir), ["sent.json"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ResolveReviewCwdTests(unittest.TestCase):
     def test_context_cwd_wins(self):
         ctx = {"focused_pane_cwd": "/repo/a"}
@@ -736,3 +732,10 @@ class SendNotesTests(StateDirTestCase):
         self.assertTrue(
             any("w1:pA1" in n and "w1:pA2" in n for n in notifications)
         )
+
+
+# Keep this at the true end of file: unittest.main() exits the process, so a
+# mid-file guard silently drops every test class defined after it (false
+# green: direct runs executed only 5 of the suite's tests once).
+if __name__ == "__main__":
+    unittest.main()
