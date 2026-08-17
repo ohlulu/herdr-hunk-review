@@ -15,6 +15,7 @@ shell out to real herdr/git/hunk.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -221,6 +222,130 @@ def wait_for_keypress():
         sys.stdin.readline()
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+def run_fzf(lines, *fzf_args):
+    """Run fzf over lines (UI renders on /dev/tty even with stdio piped).
+
+    Returns selection stdout (multi-select: newline-joined) or None on
+    cancel/Esc — fzf exits 130 on Esc, 1 on no match."""
+    try:
+        proc = subprocess.run(
+            ["fzf", *fzf_args],
+            input="\n".join(lines) + "\n",
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip("\n")
+    return out if out else None
+
+
+def git_log_lines():
+    """Colored `git log --oneline -200` lines (DEC-006), or None."""
+    out = run_git("log", "--oneline", "--color=always", "-200")
+    if not out:
+        return None
+    return out.splitlines()
+
+
+def pick_commit_sha():
+    lines = git_log_lines()
+    if not lines:
+        return None
+    selected = run_fzf(lines, "--ansi")
+    if selected is None:
+        return None
+    # fzf --ansi strips color codes from the output line, so field 0 is the sha.
+    return selected.split()[0]
+
+
+def pick_range_shas():
+    """(old, new) shas from up to two marks; (sha, None) for a single mark.
+
+    Order is derived from log position (git log is newest-first, DEC-006:
+    diff old..new), not from fzf's mark output order."""
+    lines = git_log_lines()
+    if not lines:
+        return None
+    selected = run_fzf(lines, "--ansi", "--multi", "2")
+    if selected is None:
+        return None
+    shas = [line.split()[0] for line in selected.splitlines()]
+    if len(shas) == 1:
+        return shas[0], None
+    if len(shas) != 2:
+        return None
+    log_order = [strip_ansi(line).split()[0] for line in lines]
+    try:
+        older_first = sorted(shas, key=log_order.index, reverse=True)
+    except ValueError:
+        return None
+    return older_first[0], older_first[1]
+
+
+def pick_branches():
+    """(base, compare) via two fzf rounds over local + remote branches."""
+    out = run_git(
+        "branch", "-a", "--format=%(refname:short)", "--sort=-committerdate"
+    )
+    if out is None:
+        return None
+    # origin/HEAD is an alias row, not a reviewable branch (DEC-006).
+    branches = [b for b in out.splitlines() if b and b != "origin/HEAD"]
+    if not branches:
+        return None
+    chosen_base = run_fzf(branches, "--prompt", "base> ")
+    if chosen_base is None:
+        return None
+    compare = run_fzf(branches, "--prompt", "compare> ")
+    if compare is None:
+        return None
+    return chosen_base, compare
+
+
+def pick_target(key, base):
+    """Sub-picker flow for a menu key -> (exec_argv, reload_args) or None."""
+    if key == "merge-base":
+        return target_argv("merge-base", base=base)
+    if key == "uncommitted":
+        return target_argv("uncommitted")
+    if key == "last-commit":
+        return target_argv("last-commit")
+    if key == "pick-commit":
+        sha = pick_commit_sha()
+        if sha is None:
+            return None
+        return target_argv("pick-commit", sha=sha)
+    if key == "pick-range":
+        pair = pick_range_shas()
+        if pair is None:
+            return None
+        old, new = pair
+        return target_argv("pick-range", old=old, new=new)
+    if key == "branch-vs-branch":
+        pair = pick_branches()
+        if pair is None:
+            return None
+        chosen_base, compare = pair
+        return target_argv("branch-vs-branch", base=chosen_base, compare=compare)
+    return None
+
+
+def launch_viewer(repo, exec_argv, reload_args):
+    """Reuse a live hunk session or exec into a new viewer (T009/T010)."""
+    print("viewer launch not implemented yet", file=sys.stderr)
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -261,8 +386,21 @@ def cmd_picker(args):
         wait_for_keypress()
         return 0
     os.chdir(repo)
-    print("picker: menu not implemented yet", file=sys.stderr)
-    return 1
+    base = resolve_base(run_git)
+    menu = build_menu(base)
+    # --layout=reverse renders input order top-down with the cursor on the
+    # first row, matching REQ-002's menu order + default selection.
+    label = run_fzf([label for _, label in menu], "--layout=reverse")
+    if label is None:
+        return 0  # Esc: close the pane with no residue (AC-003).
+    key = {lbl: k for k, lbl in menu}.get(label)
+    if key is None:
+        return 0
+    selection = pick_target(key, base)
+    if selection is None:
+        return 0  # Esc in any sub-picker also closes cleanly (DEC-006).
+    exec_argv, reload_args = selection
+    return launch_viewer(repo, exec_argv, reload_args)
 
 
 def cmd_send_notes(args):

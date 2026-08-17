@@ -250,3 +250,30 @@ class TargetArgvTests(unittest.TestCase):
     def test_unknown_target_raises(self):
         with self.assertRaises(ValueError):
             hr.target_argv("bogus")
+
+
+class PickRangeTests(unittest.TestCase):
+    LOG = [
+        "\x1b[33mccc333\x1b[m newest commit",
+        "\x1b[33mbbb222\x1b[m middle commit",
+        "\x1b[33maaa111\x1b[m oldest commit",
+    ]
+
+    def test_two_marks_map_to_old_new_by_log_position(self):
+        # fzf --ansi outputs plain lines; order of marks must not matter.
+        for marks in ("ccc333 newest commit\naaa111 oldest commit",
+                      "aaa111 oldest commit\nccc333 newest commit"):
+            with self.subTest(marks=marks):
+                with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
+                     mock.patch.object(hr, "run_fzf", return_value=marks):
+                    self.assertEqual(hr.pick_range_shas(), ("aaa111", "ccc333"))
+
+    def test_single_mark_means_commit_vs_worktree(self):
+        with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
+             mock.patch.object(hr, "run_fzf", return_value="bbb222 middle commit"):
+            self.assertEqual(hr.pick_range_shas(), ("bbb222", None))
+
+    def test_cancel_returns_none(self):
+        with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
+             mock.patch.object(hr, "run_fzf", return_value=None):
+            self.assertIsNone(hr.pick_range_shas())
