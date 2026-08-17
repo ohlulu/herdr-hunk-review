@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import hunk_review as hr
 
 
-class StateIOTests(unittest.TestCase):
+class StateDirTestCase(unittest.TestCase):
+    """Base: point HERDR_PLUGIN_STATE_DIR at a throwaway tempdir."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -31,6 +33,9 @@ class StateIOTests(unittest.TestCase):
                 os.environ["HERDR_PLUGIN_STATE_DIR"] = original
 
         self.addCleanup(restore)
+
+
+class StateIOTests(StateDirTestCase):
 
     def test_missing_file_returns_default(self):
         self.assertEqual(hr.read_json_state("panes.json", {}), {})
@@ -277,3 +282,68 @@ class PickRangeTests(unittest.TestCase):
         with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
              mock.patch.object(hr, "run_fzf", return_value=None):
             self.assertIsNone(hr.pick_range_shas())
+
+
+class LaunchViewerTests(StateDirTestCase):
+    def test_reuse_reloads_focuses_recorded_pane_and_skips_exec(self):
+        # AC-007: focus goes to the RECORDED viewer pane, never the picker's
+        # own HERDR_PANE_ID, and the mapping is left untouched.
+        hr.write_json_state("panes.json", {"/repo": "w1:pOLD"})
+        calls = []
+
+        def hunk(*args):
+            calls.append(("hunk",) + args)
+            return "{}"
+
+        def herdr(*args):
+            calls.append(("herdr",) + args)
+            return ""
+
+        def execvp(prog, argv):
+            calls.append(("exec", prog, tuple(argv)))
+
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pPICKER"}):
+            rc = hr.launch_viewer(
+                "/repo", ["hunk", "show"], ["show"],
+                hunk=hunk, herdr=herdr, execvp=execvp,
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            ("hunk", "session", "reload", "--repo", "/repo", "--", "show"), calls
+        )
+        self.assertIn(("herdr", "plugin", "pane", "focus", "w1:pOLD"), calls)
+        self.assertNotIn("exec", [c[0] for c in calls])
+        self.assertEqual(hr.read_json_state("panes.json", None), {"/repo": "w1:pOLD"})
+
+    def test_exec_writes_own_pane_mapping_before_exec(self):
+        # AC-008: no live session -> record repo -> own pane id, then exec
+        # the DEC-005 uncommitted argv in place.
+        exec_argv, reload_args = hr.target_argv("uncommitted")
+        recorded = {}
+
+        def execvp(prog, argv):
+            recorded["mapping_at_exec"] = hr.read_json_state("panes.json", None)
+            recorded["prog"] = prog
+            recorded["argv"] = list(argv)
+
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pPICKER"}):
+            rc = hr.launch_viewer(
+                "/repo", exec_argv, reload_args,
+                hunk=lambda *a: None, herdr=lambda *a: "", execvp=execvp,
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(recorded["prog"], "hunk")
+        self.assertEqual(recorded["argv"], ["hunk", "diff", "HEAD", "--watch"])
+        self.assertEqual(recorded["mapping_at_exec"], {"/repo": "w1:pPICKER"})
+
+    def test_reuse_without_recorded_pane_skips_focus(self):
+        herdr_calls = []
+
+        rc = hr.launch_viewer(
+            "/repo", ["hunk", "show"], ["show"],
+            hunk=lambda *a: "{}",
+            herdr=lambda *a: herdr_calls.append(a),
+            execvp=lambda prog, argv: None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(herdr_calls, [])

@@ -23,6 +23,8 @@ from pathlib import Path
 
 USAGE = "usage: hunk_review.py {open-picker|picker|send-notes}"
 
+PANES_STATE = "panes.json"  # repo root -> viewer pane id (written on exec only)
+
 # ---------------------------------------------------------------------------
 # State IO (JSON files under HERDR_PLUGIN_STATE_DIR, atomic temp + rename)
 # ---------------------------------------------------------------------------
@@ -340,10 +342,36 @@ def pick_target(key, base):
     return None
 
 
-def launch_viewer(repo, exec_argv, reload_args):
-    """Reuse a live hunk session or exec into a new viewer (T009/T010)."""
-    print("viewer launch not implemented yet", file=sys.stderr)
-    return 1
+def launch_viewer(repo, exec_argv, reload_args, hunk=None, herdr=None, execvp=None):
+    """DEC-007: reuse the live hunk session for repo, else exec into a viewer.
+
+    Runners are injectable for tests; defaults hit the real subprocesses."""
+    hunk = hunk or run_hunk
+    herdr = herdr or run_herdr
+    execvp = execvp or os.execvp
+
+    if hunk("session", "get", "--repo", repo, "--json") is not None:
+        # Live session: reload it in place, hand focus back to the recorded
+        # viewer pane, and let this picker pane exit (AC-007). Never record
+        # our own pane id here — that would point the mapping at a pane that
+        # is about to close (DEC-007).
+        if hunk("session", "reload", "--repo", repo, "--", *reload_args) is None:
+            print("hunk session reload failed")
+            wait_for_keypress()
+            return 1
+        old_pane = read_json_state(PANES_STATE, {}).get(repo)
+        if old_pane:
+            # Stale ids are harmless: focus failure is ignored by design.
+            herdr("plugin", "pane", "focus", old_pane)
+        return 0
+
+    pane_id = os.environ.get("HERDR_PANE_ID")
+    if pane_id:
+        mapping = read_json_state(PANES_STATE, {})
+        mapping[repo] = pane_id
+        write_json_state(PANES_STATE, mapping)
+    execvp(exec_argv[0], exec_argv)
+    return 0  # reached only when execvp is a test recorder
 
 
 # ---------------------------------------------------------------------------
