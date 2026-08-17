@@ -17,7 +17,12 @@ herdr plugin install ohlulu/herdr-hunk-review
 ```
 
 herdr fetches the repo, pins the commit, and keeps its own copy; re-run the
-command to upgrade (or pin a version with `--ref`).
+command to upgrade. To stay on a released version instead, pin its tag —
+`herdr plugin list` then shows the version rather than a commit:
+
+```sh
+herdr plugin install ohlulu/herdr-hunk-review --ref v0.1.0
+```
 
 For development, link a checkout instead — nothing is copied, edits are live,
 and `git pull` is the whole upgrade story:
