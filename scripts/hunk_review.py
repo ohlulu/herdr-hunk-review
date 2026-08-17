@@ -211,7 +211,12 @@ def target_argv(key, base=None, sha=None, old=None, new=None, compare=None):
         spec = f"{base}...HEAD"
         return ["hunk", "diff", spec], ["diff", spec]
     if key == "uncommitted":
-        return ["hunk", "diff", "HEAD", "--watch"], ["diff", "HEAD"]
+        # --watch must survive reload: hunk derives watch mode from the
+        # CURRENT input's options (App.tsx watchEnabled), and a session
+        # reload replaces that input wholesale — dropping the flag here
+        # would freeze a reused Uncommitted viewer (review disposition,
+        # supersedes the original DEC-005 reload column).
+        return ["hunk", "diff", "HEAD", "--watch"], ["diff", "HEAD", "--watch"]
     if key == "last-commit":
         return ["hunk", "show"], ["show"]
     if key == "pick-commit":

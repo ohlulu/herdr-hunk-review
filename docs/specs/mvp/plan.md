@@ -162,3 +162,13 @@ Critic round 1（2026-08-17，tasks phase review）— 全數 accept，皆為 co
 | [P2] README Verify 過弱 | accept | T017 Verify 改為五段 grep 驗段落存在 |
 | [P3] tasks.md 缺 frontmatter | accept | 已補 summary + read_when |
 | [P3] `git branch` 缺 `-a`（locked note） | accept | DEC-006/T008 改 `git branch -a`，濾 `origin/HEAD` alias；修正符合原意圖（含 remotes） |
+
+Code review round 2（2026-08-17，post-build diff review）：
+
+| Finding | Disposition | 處置 |
+|---------|-------------|------|
+| [P1] Reused Uncommitted session 遺失 `--watch` | accept — DEC-005 reload 欄修正 | hunk 0.18.1 的 watch 狀態取自當前 input（App.tsx `watchEnabled = input.options.watch && …`），reload 整組替換 input，`--watch` 為全域旗標可進 reload args。Uncommitted reload args 改 `diff HEAD --watch`（其餘 target 不變）；T007 任務文字中「reload drops --watch」被此條目取代 |
+| [P1] send-notes read→prompt→mark 非 atomic，concurrent invocation 重複 prompt | accept | `state/send.lock` + `fcntl.flock`（LOCK_EX\|LOCK_NB）包住整段流程；持鎖失敗 → notification『send already in progress』+ exit 1；flock 隨 process 結束自動釋放，crash 不残留 |
+| [P2] fzf 執行錯誤被視為 Esc | accept | run_fzf 只把 rc 1/130 當取消；OSError / 其餘 rc 招 RuntimeError，cmd_picker 接住後 print + 等按鍵 + exit 1（DEC-011） |
+| [P2] 直接執行 test file 只跑 5 個 tests | accept | `__main__` guard 搬至檔尾（先前 append 測試類別落在 guard 之後，direct run 提早 sys.exit） |
+| [P3] README hunk link 失效 | accept | herdr/hunk 兩個連結皆為臆造，改 brew 登記的官方首頁 herdr.dev / hunk.dev |

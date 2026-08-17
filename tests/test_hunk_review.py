@@ -220,7 +220,9 @@ class TargetArgvTests(unittest.TestCase):
             (
                 {"key": "uncommitted"},
                 ["hunk", "diff", "HEAD", "--watch"],
-                ["diff", "HEAD"],
+                # Reload keeps --watch: hunk rebuilds watch state from the
+                # reloaded input, so dropping it would freeze the viewer.
+                ["diff", "HEAD", "--watch"],
             ),
             ({"key": "last-commit"}, ["hunk", "show"], ["show"]),
             (
