@@ -133,6 +133,71 @@ def resolve_review_cwd(context_json, pane_list):
     return None
 
 
+def resolve_base(git):
+    """Merge-base ref for the review menu (REQ-003), or None.
+
+    `git` is an injected runner: git(*args) -> stripped stdout, None on failure.
+    `@{u}` is skipped when it is the current branch's own remote-tracking ref,
+    which would diff to nothing (AC-006)."""
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if upstream:
+        own_tracking = (
+            branch and "/" in upstream and upstream.split("/", 1)[1] == branch
+        )
+        if not own_tracking:
+            return upstream
+    origin_head = git("rev-parse", "--abbrev-ref", "origin/HEAD")
+    if origin_head:
+        return origin_head
+    for name in ("main", "master", "trunk"):
+        if git("rev-parse", "--verify", "--quiet", name) is not None:
+            return name
+    return None
+
+
+def build_menu(base):
+    """Target menu rows as (key, label), first row = default (REQ-002)."""
+    rows = []
+    if base:
+        rows.append(("merge-base", f"Merge base ({base}...HEAD)"))
+    rows.extend(
+        [
+            ("uncommitted", "Uncommitted"),
+            ("last-commit", "Last commit"),
+            ("pick-commit", "Pick commit"),
+            ("pick-range", "Pick range"),
+            ("branch-vs-branch", "Branch vs branch"),
+        ]
+    )
+    return rows
+
+
+def target_argv(key, base=None, sha=None, old=None, new=None, compare=None):
+    """DEC-005 table -> (exec_argv, reload_args).
+
+    exec_argv execs hunk in the picker pane; reload_args go after `--` in
+    `hunk session reload`. Only `uncommitted` watches (other targets do not
+    change with the worktree), and its reload drops `--watch`."""
+    if key == "merge-base":
+        spec = f"{base}...HEAD"
+        return ["hunk", "diff", spec], ["diff", spec]
+    if key == "uncommitted":
+        return ["hunk", "diff", "HEAD", "--watch"], ["diff", "HEAD"]
+    if key == "last-commit":
+        return ["hunk", "show"], ["show"]
+    if key == "pick-commit":
+        return ["hunk", "show", sha], ["show", sha]
+    if key == "pick-range":
+        # One mark: diff that commit against the worktree (REQ-002).
+        spec = f"{old}..{new}" if new else old
+        return ["hunk", "diff", spec], ["diff", spec]
+    if key == "branch-vs-branch":
+        spec = f"{base}...{compare}"
+        return ["hunk", "diff", spec], ["diff", spec]
+    raise ValueError(f"unknown target: {key}")
+
+
 # ---------------------------------------------------------------------------
 # Picker pane helpers
 # ---------------------------------------------------------------------------

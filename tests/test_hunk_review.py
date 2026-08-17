@@ -133,3 +133,120 @@ class PickerGuardTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("not a git repository", buf.getvalue())
         wait.assert_called_once()
+
+
+def fake_git(responses):
+    """Injected git runner: exact-args lookup; anything unlisted fails (None)."""
+
+    def git(*args):
+        return responses.get(args)
+
+    return git
+
+
+class ResolveBaseTests(unittest.TestCase):
+    def test_upstream_tracking_other_branch_wins(self):
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature",
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): "origin/main",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "origin/main")
+
+    def test_upstream_self_skipped_falls_to_origin_head(self):
+        # AC-006: feature tracking origin/feature must not diff against itself.
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature",
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"): "origin/feature",
+                ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "origin/main")
+
+    def test_conventional_branch_order(self):
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "wip",
+                ("rev-parse", "--verify", "--quiet", "master"): "abc123",
+                ("rev-parse", "--verify", "--quiet", "trunk"): "def456",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "master")
+
+    def test_all_fail_returns_none(self):
+        self.assertIsNone(hr.resolve_base(fake_git({})))
+
+
+class BuildMenuTests(unittest.TestCase):
+    def test_menu_with_base(self):
+        # AC-004: merge-base row first and default.
+        menu = hr.build_menu("origin/main")
+        self.assertEqual(menu[0], ("merge-base", "Merge base (origin/main...HEAD)"))
+        self.assertEqual(
+            [key for key, _ in menu],
+            [
+                "merge-base",
+                "uncommitted",
+                "last-commit",
+                "pick-commit",
+                "pick-range",
+                "branch-vs-branch",
+            ],
+        )
+
+    def test_menu_without_base(self):
+        # AC-005: no merge-base row; Uncommitted becomes first/default.
+        menu = hr.build_menu(None)
+        self.assertEqual(menu[0], ("uncommitted", "Uncommitted"))
+        self.assertNotIn("merge-base", [key for key, _ in menu])
+        self.assertEqual(len(menu), 5)
+
+
+class TargetArgvTests(unittest.TestCase):
+    def test_complete_argv_table(self):
+        cases = [
+            (
+                {"key": "merge-base", "base": "origin/main"},
+                ["hunk", "diff", "origin/main...HEAD"],
+                ["diff", "origin/main...HEAD"],
+            ),
+            (
+                {"key": "uncommitted"},
+                ["hunk", "diff", "HEAD", "--watch"],
+                ["diff", "HEAD"],
+            ),
+            ({"key": "last-commit"}, ["hunk", "show"], ["show"]),
+            (
+                {"key": "pick-commit", "sha": "abc123"},
+                ["hunk", "show", "abc123"],
+                ["show", "abc123"],
+            ),
+            (
+                {"key": "pick-range", "old": "old1", "new": "new2"},
+                ["hunk", "diff", "old1..new2"],
+                ["diff", "old1..new2"],
+            ),
+            (
+                # One mark: that commit against the worktree.
+                {"key": "pick-range", "old": "abc123"},
+                ["hunk", "diff", "abc123"],
+                ["diff", "abc123"],
+            ),
+            (
+                {"key": "branch-vs-branch", "base": "develop", "compare": "feature/x"},
+                ["hunk", "diff", "develop...feature/x"],
+                ["diff", "develop...feature/x"],
+            ),
+        ]
+        for kwargs, want_exec, want_reload in cases:
+            with self.subTest(**kwargs):
+                key = kwargs.pop("key")
+                got_exec, got_reload = hr.target_argv(key, **kwargs)
+                self.assertEqual(got_exec, want_exec)
+                self.assertEqual(got_reload, want_reload)
+
+    def test_unknown_target_raises(self):
+        with self.assertRaises(ValueError):
+            hr.target_argv("bogus")
