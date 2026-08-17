@@ -11,31 +11,51 @@ Single stdlib-only Python script, no build step.
 ## Install
 
 Requires herdr ≥ 0.8, hunk ≥ 0.18, fzf, git, and python3 ≥ 3.9 on `PATH`.
-Repeat on each machine (no auto-deploy):
 
 ```sh
-git clone https://github.com/ohlulu/herdr-hunk-review ~/Developer/ohlulu/herdr-hunk-review
-herdr plugin link ~/Developer/ohlulu/herdr-hunk-review
+git clone https://github.com/ohlulu/herdr-hunk-review
+herdr plugin link ./herdr-hunk-review
 ```
 
-`herdr plugin list` should now show `herdr-hunk-review`.
-
-The keybindings are hand-written into the tracked configs (see the entries added
-to `~/.config/kitty/kitty.conf` under *TUI launchers* and the two
-`[[keys.command]]` entries in `~/.config/herdr/config.toml`); after editing run
-`herdr server reload-config`.
+`herdr plugin list` should now show `herdr-hunk-review`. The link registers
+the checkout by path — nothing is copied, so `git pull` is the whole upgrade
+story.
 
 ## Keybindings
 
-| Key | Where | Action |
-|-----|-------|--------|
-| `cmd+shift+h` | kitty (bridged to `ctrl+alt+shift+h`) | Open the review target picker |
-| `prefix+alt+h` | any terminal attached to herdr | Same as above |
-| `cmd+shift+s` | kitty (bridged to `ctrl+alt+shift+s`) | Send hunk notes to the agent pane |
-| `prefix+alt+s` | any terminal attached to herdr | Same as above |
+The plugin ships two actions and no default keys. Bind them in
+`~/.config/herdr/config.toml`:
 
-The kitty rows are CSI u bridges (`\x1b[104;8u`, `\x1b[115;8u`) so herdr
-intercepts the chord even when the focused TUI (hunk included) never sees it.
+```toml
+[[keys.command]]
+key = ["prefix+alt+h", "ctrl+alt+shift+h"]
+type = "plugin_action"
+command = "herdr-hunk-review.review"
+
+[[keys.command]]
+key = ["prefix+alt+s", "ctrl+alt+shift+s"]
+type = "plugin_action"
+command = "herdr-hunk-review.send-notes"
+```
+
+Then run `herdr server reload-config`.
+
+On macOS kitty, bridge the `cmd` chords onto those bindings with CSI u
+sequences in `~/.config/kitty/kitty.conf`:
+
+```
+map cmd+shift+h         send_text all \x1b[104;8u
+map cmd+shift+s         send_text all \x1b[115;8u
+```
+
+The bridge lets herdr intercept the chord even when the focused TUI (hunk
+included) never sees the key. In other terminals use the `prefix+alt+h/s` or
+`ctrl+alt+shift+h/s` bindings directly.
+
+| Key | Action |
+|-----|--------|
+| `cmd+shift+h` (kitty) · `prefix+alt+h` · `ctrl+alt+shift+h` | Open the review target picker |
+| `cmd+shift+s` (kitty) · `prefix+alt+s` · `ctrl+alt+shift+s` | Send hunk notes to the agent pane |
 
 ## Review targets
 
