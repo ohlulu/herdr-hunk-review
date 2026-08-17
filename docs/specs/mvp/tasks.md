@@ -38,8 +38,8 @@ read_when:
 
 ## Phase 6: Keybindings + docs (REQ-009)
 
-- [ ] T015 [REQ-009] Add kitty CSI u bridge in `~/.config/kitty/kitty.conf` TUI launchers block: `cmd+shift+h` → `\x1b[104;8u`, `cmd+shift+s` → `\x1b[115;8u`, matching existing entry style (DEC-012). Verify: `grep -c -e '104;8u' -e '115;8u' ~/.config/kitty/kitty.conf` → 2
-- [ ] T016 [REQ-009] Add herdr `[[keys.command]]` entries in `~/.config/herdr/config.toml`: `["prefix+alt+h", "ctrl+alt+shift+h"]` → `plugin_action herdr-hunk-review.review`, `["prefix+alt+s", "ctrl+alt+shift+s"]` → `plugin_action herdr-hunk-review.send-notes`, comment style per existing lazygit/yazi entries, then reload. Verify: `herdr server reload-config && grep -c 'herdr-hunk-review\.' ~/.config/herdr/config.toml` → 2
+- [x] T015 [REQ-009] Add kitty CSI u bridge in `~/.config/kitty/kitty.conf` TUI launchers block: `cmd+shift+h` → `\x1b[104;8u`, `cmd+shift+s` → `\x1b[115;8u`, matching existing entry style (DEC-012). Verify: `grep -c -e '104;8u' -e '115;8u' ~/.config/kitty/kitty.conf` → 2
+- [x] T016 [REQ-009] Add herdr `[[keys.command]]` entries in `~/.config/herdr/config.toml`: `["prefix+alt+h", "ctrl+alt+shift+h"]` → `plugin_action herdr-hunk-review.review`, `["prefix+alt+s", "ctrl+alt+shift+s"]` → `plugin_action herdr-hunk-review.send-notes`, comment style per existing lazygit/yazi entries, then reload. Verify: `herdr server reload-config && grep -c 'herdr-hunk-review\.' ~/.config/herdr/config.toml` → 2
 - [ ] T017 [REQ-009] Create `README.md` with sections: Install (git clone + `herdr plugin link` on each machine), Keybindings (cmd+shift+h / cmd+shift+s table), Review targets (semantics per REQ-002), Sending notes (behavior + agent resolution order). Verify: `grep -q 'herdr plugin link' README.md && grep -q 'cmd+shift+h' README.md && grep -q 'cmd+shift+s' README.md && grep -qi 'review target' README.md && grep -qi 'agent resolution' README.md` → exit 0
 
 ## Human Acceptance
