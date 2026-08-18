@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Pick a git review target, view it in hunk, send inline notes to an agent pane.
+"""Pick a git review target, view it in tuicr, send inline notes to an agent pane.
 
 Subcommands:
   open-picker  action: open the picker pane in the current tab (REQ-001)
-  picker       pane entrypoint: fzf target picker that becomes the hunk viewer
+  picker       pane entrypoint: fzf target picker that becomes the tuicr viewer
                (REQ-002..005)
-  send-notes   action: paste unsent user hunk notes into the resolved agent
+  send-notes   action: paste unsent review comments into the resolved agent
                pane's input as one editable draft (REQ-006..008)
 
 Design (DEC-001, DEC-002): single stdlib-only file. Pure decision functions
 take injected runner callables; subprocess glue stays thin so tests never
-shell out to real herdr/git/hunk.
+shell out to real herdr/git/tuicr.
 """
 
 import fcntl
@@ -23,10 +23,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-USAGE = "usage: hunk_review.py {open-picker|picker|send-notes}"
+USAGE = "usage: review.py {open-picker|picker|send-notes}"
 
 PANES_STATE = "panes.json"  # repo root -> viewer pane id (written on exec only)
-SENT_STATE = "sent.json"  # hunk session id -> [delivered noteId, ...]
+SENT_STATE = "sent.json"  # tuicr session slug -> [delivered comment id, ...]
 SEND_LOCK = "send.lock"  # cross-process claim for the whole send flow
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ SEND_LOCK = "send.lock"  # cross-process claim for the whole send flow
 def state_dir():
     """Directory for plugin state files, created on first use."""
     root = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.join(
-        tempfile.gettempdir(), "herdr-hunk-review-state"
+        tempfile.gettempdir(), "herdr-review-state"
     )
     path = Path(root)
     path.mkdir(parents=True, exist_ok=True)
@@ -95,8 +95,8 @@ def run_git(*args):
     return _run(["git", *args])
 
 
-def run_hunk(*args):
-    return _run(["hunk", *args])
+def run_tuicr(*args):
+    return _run(["tuicr", *args])
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ def herdr_send_input(pane_id, text):
     socket_path = os.environ.get("HERDR_SOCKET_PATH")
     if not socket_path:
         return False
-    request_id = "hunk-review:send-input"
+    request_id = "herdr-review:send-input"
     request = json.dumps(
         {
             "id": request_id,
@@ -394,32 +394,27 @@ def build_menu(base):
 
 
 def target_argv(key, base=None, sha=None, old=None, new=None, compare=None):
-    """DEC-005 table -> (exec_argv, reload_args).
+    """DEC-005 table -> exec_argv for tuicr.
 
-    exec_argv execs hunk in the picker pane; reload_args go after `--` in
-    `hunk session reload`. Only `uncommitted` watches (other targets do not
-    change with the worktree), and its reload drops `--watch`."""
+    tuicr takes one `-r <revset>` instead of hunk's diff/show verbs, and `-w`
+    for worktree state. `-w` alone is uncommitted-only; combined with `-r` it
+    extends the range through the worktree (DEC-015)."""
     if key == "merge-base":
-        spec = f"{base}...HEAD"
-        return ["hunk", "diff", spec], ["diff", spec]
+        return ["tuicr", "-r", f"{base}...HEAD"]
     if key == "uncommitted":
-        # --watch must survive reload: hunk derives watch mode from the
-        # CURRENT input's options (App.tsx watchEnabled), and a session
-        # reload replaces that input wholesale — dropping the flag here
-        # would freeze a reused Uncommitted viewer (review disposition,
-        # supersedes the original DEC-005 reload column).
-        return ["hunk", "diff", "HEAD", "--watch"], ["diff", "HEAD", "--watch"]
+        # No watch equivalent in tuicr — the viewer is a snapshot (DEC-016).
+        return ["tuicr", "-w"]
     if key == "last-commit":
-        return ["hunk", "show"], ["show"]
+        return ["tuicr", "-r", "HEAD"]
     if key == "pick-commit":
-        return ["hunk", "show", sha], ["show", sha]
+        return ["tuicr", "-r", sha]
     if key == "pick-range":
-        # One mark: diff that commit against the worktree (REQ-002).
-        spec = f"{old}..{new}" if new else old
-        return ["hunk", "diff", spec], ["diff", spec]
+        # One mark: that commit through the worktree, so -w joins the range.
+        if new:
+            return ["tuicr", "-r", f"{old}..{new}"]
+        return ["tuicr", "-r", f"{old}..HEAD", "-w"]
     if key == "branch-vs-branch":
-        spec = f"{base}...{compare}"
-        return ["hunk", "diff", spec], ["diff", spec]
+        return ["tuicr", "-r", f"{base}...{compare}"]
     raise ValueError(f"unknown target: {key}")
 
 
@@ -446,23 +441,25 @@ def resolve_agent(focused_pane_id, focused_tab_id, agent_panes, neighbor_ids, re
     return None, candidates
 
 
-def format_prompt(worktree, notes):
-    """DEC-010 fixed English template; one `filePath:line — body` row per note.
+def format_prompt(worktree, comments):
+    """DEC-010 fixed English template; one `path:lines — content` row per comment.
 
-    Line number prefers newRange[0], falls back to oldRange[0], else the
-    `:line` suffix is omitted. Multi-line bodies pass through verbatim."""
+    tuicr carries real ranges, so a multi-line comment renders `path:10-14`
+    rather than collapsing to its first line. A file-level comment has no
+    lines, a review-level comment has no path, and a classified comment keeps
+    its `[type]` tag so the agent sees nit vs issue (DEC-020). Multi-line
+    bodies pass through verbatim."""
     lines = [f"Human inline review comments on your changes in {worktree}:", ""]
-    for note in notes:
-        location = note.get("filePath", "")
-        line_no = None
-        for range_key in ("newRange", "oldRange"):
-            rng = note.get(range_key)
-            if rng:
-                line_no = rng[0]
-                break
-        if line_no is not None:
-            location = f"{location}:{line_no}"
-        lines.append(f"- {location} — {note.get('body', '')}")
+    for comment in comments:
+        location = comment.get("path") or "(review)"
+        start = comment.get("start_line")
+        end = comment.get("end_line")
+        if start is not None:
+            span = f"{start}-{end}" if end is not None and end != start else f"{start}"
+            location = f"{location}:{span}"
+        kind = comment.get("comment_type")
+        tag = f"[{kind}] " if kind and kind != "none" else ""
+        lines.append(f"- {location} — {tag}{comment.get('content', '')}")
     lines.append("")
     lines.append(
         "Address each comment and verify the result. "
@@ -625,32 +622,27 @@ def pick_target(key, base):
     return None
 
 
-def launch_viewer(repo, exec_argv, reload_args, hunk=None, herdr=None, execvp=None):
-    """DEC-007: reuse the live hunk session for repo, else exec into a viewer.
+def launch_viewer(repo, exec_argv, herdr=None, execvp=None):
+    """DEC-007: close any recorded viewer for repo, then exec into this pane.
+
+    tuicr has no reload verb, so a target switch cannot mutate a running
+    viewer in place. Closing the stale pane and letting the picker pane become
+    the new viewer keeps the one-viewer-per-repo invariant of AC-007; tuicr
+    persists comments per target slug, so revisiting a target restores its
+    notes instead of losing them (DEC-017).
 
     Runners are injectable for tests; defaults hit the real subprocesses."""
-    hunk = hunk or run_hunk
     herdr = herdr or run_herdr
     execvp = execvp or os.execvp
 
-    if hunk("session", "get", "--repo", repo, "--json") is not None:
-        # Live session: reload it in place, hand focus back to the recorded
-        # viewer pane, and let this picker pane exit (AC-007). Never record
-        # our own pane id here — that would point the mapping at a pane that
-        # is about to close (DEC-007).
-        if hunk("session", "reload", "--repo", repo, "--", *reload_args) is None:
-            print("hunk session reload failed")
-            wait_for_keypress()
-            return 1
-        old_pane = read_json_state(PANES_STATE, {}).get(repo)
-        if old_pane:
-            # Stale ids are harmless: focus failure is ignored by design.
-            herdr("plugin", "pane", "focus", old_pane)
-        return 0
-
     pane_id = os.environ.get("HERDR_PANE_ID")
+    mapping = read_json_state(PANES_STATE, {})
+    old_pane = mapping.get(repo)
+    if old_pane and old_pane != pane_id:
+        # Stale ids are harmless: close failure is ignored by design.
+        herdr("plugin", "pane", "close", old_pane)
+
     if pane_id:
-        mapping = read_json_state(PANES_STATE, {})
         mapping[repo] = pane_id
         write_json_state(PANES_STATE, mapping)
     execvp(exec_argv[0], exec_argv)
@@ -673,10 +665,10 @@ def cmd_open_picker(args):
             context = None
     cwd = resolve_review_cwd(context, herdr_pane_list())
     if not cwd:
-        return fail_action("hunk-review: cannot determine focused pane cwd")
+        return fail_action("herdr-review: cannot determine focused pane cwd")
     out = run_herdr(
         "plugin", "pane", "open",
-        "--plugin", "herdr-hunk-review",
+        "--plugin", "herdr-review",
         "--entrypoint", "picker",
         "--placement", "split",
         "--direction", "right",
@@ -684,7 +676,7 @@ def cmd_open_picker(args):
         "--focus",
     )
     if out is None:
-        return fail_action("hunk-review: failed to open picker pane")
+        return fail_action("herdr-review: failed to open picker pane")
     return 0
 
 
@@ -717,31 +709,70 @@ def cmd_picker(args):
         return 1
     if selection is None:
         return 0  # Esc in any sub-picker also closes cleanly (DEC-006).
-    exec_argv, reload_args = selection
-    return launch_viewer(repo, exec_argv, reload_args)
+    return launch_viewer(repo, selection)
 
 
-def filter_unsent(notes, sent_ids):
-    """Notes whose noteId has not been delivered yet (AC-014)."""
+def filter_unsent(comments, sent_ids):
+    """Comments whose id has not been delivered yet (AC-014)."""
     sent = set(sent_ids or [])
-    return [note for note in notes if note.get("noteId") not in sent]
+    return [c for c in comments if c.get("id") not in sent]
 
 
-def gc_sent(sent, live_session_ids):
-    """Drop sent entries whose hunk session no longer exists (DEC-008)."""
-    live = set(live_session_ids or [])
-    return {sid: ids for sid, ids in sent.items() if sid in live}
+def gc_sent(sent, live_slugs):
+    """Drop sent entries whose tuicr session no longer exists (DEC-008)."""
+    live = set(live_slugs or [])
+    return {slug: ids for slug, ids in sent.items() if slug in live}
 
 
-def hunk_live_session_ids():
-    """Session ids from `hunk session list --json`, or None on failure."""
-    out = run_hunk("session", "list", "--json")
+def tuicr_sessions(repo=None, tuicr=None):
+    """Session rows from `tuicr review list`, or None on failure.
+
+    Documented agent-facing contract (tuicr docs/REVIEW_CLI.md): a JSON array
+    of {slug, kind, path, updated_at, comment_count, active, ...}. A repo
+    scopes the listing to that checkout; omitting it lists every session,
+    which is what the sent-record GC must compare against."""
+    tuicr = tuicr or run_tuicr
+    selector = ("--repo", repo) if repo else ("--all",)
+    out = tuicr("review", "list", *selector)
     if out is None:
         return None
     try:
-        return [s.get("sessionId") for s in json.loads(out)["sessions"]]
-    except (ValueError, KeyError, TypeError):
+        rows = json.loads(out)
+    except ValueError:
         return None
+    return rows if isinstance(rows, list) else None
+
+
+def pick_session(sessions):
+    """The session to collect notes from: the live one, else the newest.
+
+    tuicr keeps a session file after the TUI exits, so notes written in a
+    closed viewer stay recoverable instead of being stranded the way a dead
+    hunk session stranded them. A pick that is not the running viewer is named
+    in the notification, so the fallback is visible rather than silent
+    (DEC-018)."""
+    if not sessions:
+        return None
+    active = [s for s in sessions if s.get("active")]
+    return max(active or sessions, key=lambda s: s.get("updated_at") or "")
+
+
+def tuicr_comments(repo, slug, tuicr=None):
+    """Local-draft comments of a session, newest last, or None on failure.
+
+    `lifecycle_state` filters out comments already published to a forge, the
+    way hunk's `--type user` filtered out agent notes (DEC-019)."""
+    tuicr = tuicr or run_tuicr
+    out = tuicr("review", "comments", "--session", slug, "--repo", repo)
+    if out is None:
+        return None
+    try:
+        rows = json.loads(out)
+    except ValueError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    return [c for c in rows if c.get("lifecycle_state") == "local_draft"]
 
 
 def resolve_agent_for(focused_pane, repo):
@@ -781,49 +812,43 @@ def acquire_send_lock():
 
 
 def cmd_send_notes(args):
-    """Action: paste unsent user hunk notes into the resolved agent pane's
-    input as one editable draft (REQ-006..008, DEC-008..011, DEC-014)."""
+    """Action: paste unsent tuicr review comments into the resolved agent
+    pane's input as one editable draft (REQ-006..008, DEC-014, DEC-018..021)."""
     focused = None
     for pane in herdr_pane_list() or []:
         if pane.get("focused"):
             focused = pane
             break
     if focused is None:
-        return fail_action("hunk-review: cannot determine focused pane")
+        return fail_action("herdr-review: cannot determine focused pane")
 
     cwd = focused.get("cwd")
     repo = run_git("-C", cwd, "rev-parse", "--show-toplevel") if cwd else None
     if repo is None:
-        return fail_action("hunk-review: focused pane is not in a git repository")
+        return fail_action("herdr-review: focused pane is not in a git repository")
 
-    out = run_hunk("session", "get", "--repo", repo, "--json")
-    session_id = None
-    if out is not None:
-        try:
-            session_id = json.loads(out)["session"]["sessionId"]
-        except (ValueError, KeyError, TypeError):
-            session_id = None
-    if not session_id:
-        # AC-011: without a live session there is nothing to collect.
-        return fail_action(f"hunk-review: no live hunk session for {repo}")
+    sessions = tuicr_sessions(repo)
+    if sessions is None:
+        return fail_action("herdr-review: failed to list tuicr review sessions")
+    session = pick_session(sessions)
+    if session is None:
+        # AC-011: no session file means nothing was ever reviewed here.
+        return fail_action(f"herdr-review: no tuicr review session for {repo}")
+    slug = session.get("slug")
+    if not slug:
+        return fail_action("herdr-review: unexpected tuicr review list output")
 
     send_lock = acquire_send_lock()  # held (referenced) until process exit
     if send_lock is None:
-        run_herdr("notification", "show", "hunk-review: send already in progress")
+        run_herdr("notification", "show", "herdr-review: send already in progress")
         return 1
 
-    out = run_hunk(
-        "session", "comment", "list", "--repo", repo, "--type", "user", "--json"
-    )
-    if out is None:
-        return fail_action("hunk-review: failed to list hunk notes")
-    try:
-        notes = json.loads(out)["comments"]
-    except (ValueError, KeyError, TypeError):
-        return fail_action("hunk-review: unexpected hunk comment list output")
+    comments = tuicr_comments(repo, slug)
+    if comments is None:
+        return fail_action("herdr-review: failed to read tuicr review comments")
 
     sent = read_json_state(SENT_STATE, {})
-    unsent = filter_unsent(notes, sent.get(session_id, []))
+    unsent = filter_unsent(comments, sent.get(slug, []))
     if not unsent:
         run_herdr("notification", "show", "No new notes to send")  # AC-010
         return 0
@@ -832,46 +857,37 @@ def cmd_send_notes(args):
     if agent_pane is None:
         if candidates:
             return fail_action(
-                "hunk-review: multiple agent panes match: "
+                "herdr-review: multiple agent panes match: "
                 + ", ".join(candidates)
                 + " — focus next to the target agent and retry"
             )
-        return fail_action("hunk-review: no agent pane found")
+        return fail_action("herdr-review: no agent pane found")
 
     prompt = format_prompt(repo, unsent)
     # Draft, not submit: the human reviews/edits in the composer and presses
     # Enter themselves (DEC-014).
     if not herdr_send_input(agent_pane, prompt):
-        return fail_action("hunk-review: failed to paste notes into agent pane")
+        return fail_action("herdr-review: failed to paste notes into agent pane")
 
-    # Mark BEFORE comment rm: if rm fails the note stays visible in hunk but
-    # must never be pasted twice (AC-014). Pasted = delivered — a draft the
-    # human later discards is not re-sendable (documented in README).
-    delivered = [note.get("noteId") for note in unsent]
-    sent.setdefault(session_id, []).extend(delivered)
-    live = hunk_live_session_ids()
+    # tuicr has no CLI delete, so the sent-id record is the only duplicate
+    # guard — comments stay in the viewer as the review record instead of
+    # vanishing on send (DEC-021). Pasted = delivered: a draft the human later
+    # discards is not re-sendable (documented in README).
+    sent.setdefault(slug, []).extend(c.get("id") for c in unsent)
+    live = tuicr_sessions()  # every repo: sent.json is global, unlike the pick
     if live is not None:
-        # Keep the current session even if the list read races the daemon.
-        sent = gc_sent(sent, set(live) | {session_id})
+        # Keep the current slug even if the list read races a session rewrite.
+        sent = gc_sent(sent, {s.get("slug") for s in live} | {slug})
     write_json_state(SENT_STATE, sent)
 
-    failed_rm = [
-        note_id
-        for note_id in delivered
-        if run_hunk("session", "comment", "rm", "--repo", repo, note_id) is None
-    ]
-    if failed_rm:
-        # Notify only; the sent-id record already guards against re-delivery.
-        run_herdr(
-            "notification",
-            "show",
-            f"hunk-review: failed to remove {len(failed_rm)} note(s) from hunk",
-        )
-
+    # Naming the source only in the fallback case keeps the common
+    # notification short while making a stale pick impossible to miss.
+    source = "" if session.get("active") else f" from closed session {slug}"
     run_herdr(
         "notification",
         "show",
-        f"Pasted {len(unsent)} note(s) into {agent_pane} — press Enter to send",
+        f"Pasted {len(unsent)} note(s){source} into {agent_pane}"
+        " — press Enter to send",
     )
     return 0
 

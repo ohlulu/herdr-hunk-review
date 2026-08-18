@@ -1,4 +1,4 @@
-"""Tests for scripts/hunk_review.py (stdlib unittest).
+"""Tests for scripts/review.py (stdlib unittest).
 
 Pure-logic tests inject fake runners and never shell out; the
 ResolveForkParentGitIntegrationTests class is the deliberate exception and
@@ -22,7 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-import hunk_review as hr
+import review as hr
 
 
 class StateDirTestCase(unittest.TestCase):
@@ -105,7 +105,7 @@ class OpenPickerTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         run.assert_called_once_with(
             "plugin", "pane", "open",
-            "--plugin", "herdr-hunk-review",
+            "--plugin", "herdr-review",
             "--entrypoint", "picker",
             "--placement", "split",
             "--direction", "right",
@@ -508,45 +508,31 @@ class TargetArgvTests(unittest.TestCase):
         cases = [
             (
                 {"key": "merge-base", "base": "origin/main"},
-                ["hunk", "diff", "origin/main...HEAD"],
-                ["diff", "origin/main...HEAD"],
+                ["tuicr", "-r", "origin/main...HEAD"],
             ),
-            (
-                {"key": "uncommitted"},
-                ["hunk", "diff", "HEAD", "--watch"],
-                # Reload keeps --watch: hunk rebuilds watch state from the
-                # reloaded input, so dropping it would freeze the viewer.
-                ["diff", "HEAD", "--watch"],
-            ),
-            ({"key": "last-commit"}, ["hunk", "show"], ["show"]),
-            (
-                {"key": "pick-commit", "sha": "abc123"},
-                ["hunk", "show", "abc123"],
-                ["show", "abc123"],
-            ),
+            # No watch equivalent in tuicr: the viewer is a snapshot.
+            ({"key": "uncommitted"}, ["tuicr", "-w"]),
+            ({"key": "last-commit"}, ["tuicr", "-r", "HEAD"]),
+            ({"key": "pick-commit", "sha": "abc123"}, ["tuicr", "-r", "abc123"]),
             (
                 {"key": "pick-range", "old": "old1", "new": "new2"},
-                ["hunk", "diff", "old1..new2"],
-                ["diff", "old1..new2"],
+                ["tuicr", "-r", "old1..new2"],
             ),
             (
-                # One mark: that commit against the worktree.
+                # One mark: that commit through the worktree, so -w joins the
+                # range instead of standing alone.
                 {"key": "pick-range", "old": "abc123"},
-                ["hunk", "diff", "abc123"],
-                ["diff", "abc123"],
+                ["tuicr", "-r", "abc123..HEAD", "-w"],
             ),
             (
                 {"key": "branch-vs-branch", "base": "develop", "compare": "feature/x"},
-                ["hunk", "diff", "develop...feature/x"],
-                ["diff", "develop...feature/x"],
+                ["tuicr", "-r", "develop...feature/x"],
             ),
         ]
-        for kwargs, want_exec, want_reload in cases:
+        for kwargs, want_exec in cases:
             with self.subTest(**kwargs):
                 key = kwargs.pop("key")
-                got_exec, got_reload = hr.target_argv(key, **kwargs)
-                self.assertEqual(got_exec, want_exec)
-                self.assertEqual(got_reload, want_reload)
+                self.assertEqual(hr.target_argv(key, **kwargs), want_exec)
 
     def test_unknown_target_raises(self):
         with self.assertRaises(ValueError):
@@ -655,15 +641,12 @@ class PickRangeTests(unittest.TestCase):
 
 
 class LaunchViewerTests(StateDirTestCase):
-    def test_reuse_reloads_focuses_recorded_pane_and_skips_exec(self):
-        # AC-007: focus goes to the RECORDED viewer pane, never the picker's
-        # own HERDR_PANE_ID, and the mapping is left untouched.
+    def test_reuse_closes_recorded_pane_then_execs_in_place(self):
+        # AC-007: one viewer per repo. tuicr cannot reload, so the stale pane
+        # is closed and this picker pane becomes the viewer, taking over the
+        # mapping.
         hr.write_json_state("panes.json", {"/repo": "w1:pOLD"})
         calls = []
-
-        def hunk(*args):
-            calls.append(("hunk",) + args)
-            return "{}"
 
         def herdr(*args):
             calls.append(("herdr",) + args)
@@ -674,21 +657,18 @@ class LaunchViewerTests(StateDirTestCase):
 
         with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pPICKER"}):
             rc = hr.launch_viewer(
-                "/repo", ["hunk", "show"], ["show"],
-                hunk=hunk, herdr=herdr, execvp=execvp,
+                "/repo", ["tuicr", "-r", "HEAD"], herdr=herdr, execvp=execvp
             )
         self.assertEqual(rc, 0)
-        self.assertIn(
-            ("hunk", "session", "reload", "--repo", "/repo", "--", "show"), calls
+        self.assertIn(("herdr", "plugin", "pane", "close", "w1:pOLD"), calls)
+        self.assertIn(("exec", "tuicr", ("tuicr", "-r", "HEAD")), calls)
+        self.assertEqual(
+            hr.read_json_state("panes.json", None), {"/repo": "w1:pPICKER"}
         )
-        self.assertIn(("herdr", "plugin", "pane", "focus", "w1:pOLD"), calls)
-        self.assertNotIn("exec", [c[0] for c in calls])
-        self.assertEqual(hr.read_json_state("panes.json", None), {"/repo": "w1:pOLD"})
 
     def test_exec_writes_own_pane_mapping_before_exec(self):
-        # AC-008: no live session -> record repo -> own pane id, then exec
-        # the DEC-005 uncommitted argv in place.
-        exec_argv, reload_args = hr.target_argv("uncommitted")
+        # AC-008: record repo -> own pane id, then exec the uncommitted argv.
+        exec_argv = hr.target_argv("uncommitted")
         recorded = {}
 
         def execvp(prog, argv):
@@ -698,24 +678,36 @@ class LaunchViewerTests(StateDirTestCase):
 
         with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pPICKER"}):
             rc = hr.launch_viewer(
-                "/repo", exec_argv, reload_args,
-                hunk=lambda *a: None, herdr=lambda *a: "", execvp=execvp,
+                "/repo", exec_argv, herdr=lambda *a: "", execvp=execvp
             )
         self.assertEqual(rc, 0)
-        self.assertEqual(recorded["prog"], "hunk")
-        self.assertEqual(recorded["argv"], ["hunk", "diff", "HEAD", "--watch"])
+        self.assertEqual(recorded["prog"], "tuicr")
+        self.assertEqual(recorded["argv"], ["tuicr", "-w"])
         self.assertEqual(recorded["mapping_at_exec"], {"/repo": "w1:pPICKER"})
 
-    def test_reuse_without_recorded_pane_skips_focus(self):
+    def test_no_recorded_pane_skips_close(self):
         herdr_calls = []
 
         rc = hr.launch_viewer(
-            "/repo", ["hunk", "show"], ["show"],
-            hunk=lambda *a: "{}",
+            "/repo", ["tuicr", "-r", "HEAD"],
             herdr=lambda *a: herdr_calls.append(a),
             execvp=lambda prog, argv: None,
         )
         self.assertEqual(rc, 0)
+        self.assertEqual(herdr_calls, [])
+
+    def test_recorded_pane_equal_to_own_is_not_closed(self):
+        # Re-picking from a pane that is already the recorded viewer must not
+        # close the pane the exec is about to land in.
+        hr.write_json_state("panes.json", {"/repo": "w1:pSAME"})
+        herdr_calls = []
+
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w1:pSAME"}):
+            hr.launch_viewer(
+                "/repo", ["tuicr", "-r", "HEAD"],
+                herdr=lambda *a: herdr_calls.append(a),
+                execvp=lambda prog, argv: None,
+            )
         self.assertEqual(herdr_calls, [])
 
 
@@ -739,7 +731,7 @@ class ResolveAgentTests(unittest.TestCase):
         self.assertEqual(candidates, [])
 
     def test_left_neighbor_agent_wins(self):
-        # AC-012: focused hunk pane, agent to the left.
+        # AC-012: focused viewer pane, agent to the left.
         pane, candidates = hr.resolve_agent(
             "w1:pHUNK",
             "w1:t1",
@@ -781,16 +773,18 @@ class ResolveAgentTests(unittest.TestCase):
 
 
 class FormatPromptTests(unittest.TestCase):
-    def test_line_prefers_new_range(self):
-        notes = [
-            {
-                "noteId": "n1",
-                "filePath": "src/app.py",
-                "oldRange": [10, 12],
-                "newRange": [11, 13],
-                "body": "Rename this.",
-            }
-        ]
+    @staticmethod
+    def comment(**kwargs):
+        base = {
+            "id": "c1", "path": None, "start_line": None, "end_line": None,
+            "comment_type": "none", "lifecycle_state": "local_draft", "content": "",
+        }
+        base.update(kwargs)
+        return base
+
+    def test_single_line_comment(self):
+        notes = [self.comment(path="src/app.py", start_line=11, end_line=11,
+                              content="Rename this.")]
         prompt = hr.format_prompt("/repo", notes)
         self.assertIn("- src/app.py:11 — Rename this.", prompt)
         self.assertTrue(
@@ -805,62 +799,141 @@ class FormatPromptTests(unittest.TestCase):
             )
         )
 
-    def test_line_falls_back_to_old_range(self):
-        notes = [
-            {
-                "noteId": "n2",
-                "filePath": "lib/util.py",
-                "oldRange": [7, 7],
-                "newRange": None,
-                "body": "Why removed?",
-            }
-        ]
-        self.assertIn("- lib/util.py:7 — Why removed?", hr.format_prompt("/r", notes))
+    def test_range_comment_keeps_both_bounds(self):
+        # The capability hunk never had: a comment spanning lines 10-14.
+        notes = [self.comment(path="lib/util.py", start_line=10, end_line=14,
+                              content="Simplify this block.")]
+        self.assertIn("- lib/util.py:10-14 — Simplify this block.",
+                      hr.format_prompt("/r", notes))
 
-    def test_no_ranges_omits_line_suffix(self):
-        notes = [
-            {
-                "noteId": "n3",
-                "filePath": "README.md",
-                "oldRange": None,
-                "newRange": None,
-                "body": "General: tighten intro.",
-            }
-        ]
-        self.assertIn("- README.md — General: tighten intro.", hr.format_prompt("/r", notes))
+    def test_comment_type_is_tagged(self):
+        notes = [self.comment(path="a.py", start_line=3, end_line=3,
+                              comment_type="nit", content="Spacing.")]
+        self.assertIn("- a.py:3 — [nit] Spacing.", hr.format_prompt("/r", notes))
+
+    def test_file_level_comment_omits_line_suffix(self):
+        notes = [self.comment(path="README.md", content="General: tighten intro.")]
+        self.assertIn("- README.md — General: tighten intro.",
+                      hr.format_prompt("/r", notes))
+
+    def test_review_level_comment_has_no_path(self):
+        notes = [self.comment(content="Overall: ship it.")]
+        self.assertIn("- (review) — Overall: ship it.", hr.format_prompt("/r", notes))
 
     def test_multiline_body_verbatim(self):
-        notes = [
-            {
-                "noteId": "n4",
-                "filePath": "a.py",
-                "oldRange": None,
-                "newRange": [3, 4],
-                "body": "First line.\nSecond line.",
-            }
-        ]
-        self.assertIn("- a.py:3 — First line.\nSecond line.", hr.format_prompt("/r", notes))
+        notes = [self.comment(path="a.py", start_line=3, end_line=3,
+                              content="First line.\nSecond line.")]
+        self.assertIn("- a.py:3 — First line.\nSecond line.",
+                      hr.format_prompt("/r", notes))
 
 
 class FilterUnsentTests(unittest.TestCase):
     NOTES = [
-        {"noteId": "n1", "filePath": "a.py", "oldRange": None, "newRange": [1, 2], "body": "x"},
-        {"noteId": "n2", "filePath": "b.py", "oldRange": [3, 3], "newRange": None, "body": "y"},
+        {"id": "c1", "path": "a.py", "start_line": 1, "content": "x"},
+        {"id": "c2", "path": "b.py", "start_line": 3, "content": "y"},
     ]
 
     def test_excludes_recorded_ids(self):
-        self.assertEqual(hr.filter_unsent(self.NOTES, ["n1"]), [self.NOTES[1]])
+        self.assertEqual(hr.filter_unsent(self.NOTES, ["c1"]), [self.NOTES[1]])
 
     def test_empty_sent_keeps_all(self):
         self.assertEqual(hr.filter_unsent(self.NOTES, []), self.NOTES)
         self.assertEqual(hr.filter_unsent(self.NOTES, None), self.NOTES)
 
     def test_gc_drops_dead_sessions(self):
-        sent = {"sess-live": ["n1"], "sess-dead": ["n2"]}
+        sent = {"slug-live": ["c1"], "slug-dead": ["c2"]}
         self.assertEqual(
-            hr.gc_sent(sent, ["sess-live"]), {"sess-live": ["n1"]}
+            hr.gc_sent(sent, ["slug-live"]), {"slug-live": ["c1"]}
         )
         self.assertEqual(hr.gc_sent(sent, []), {})
+
+
+class PickSessionTests(unittest.TestCase):
+    def test_prefers_active_over_newer_inactive(self):
+        rows = [
+            {"slug": "stale", "active": False, "updated_at": "2026-09-09T00:00:00Z"},
+            {"slug": "live", "active": True, "updated_at": "2026-01-01T00:00:00Z"},
+        ]
+        self.assertEqual(hr.pick_session(rows)["slug"], "live")
+
+    def test_falls_back_to_newest_when_none_active(self):
+        # A closed viewer keeps its session file, so unsent notes written there
+        # stay recoverable (DEC-018).
+        rows = [
+            {"slug": "old", "active": False, "updated_at": "2026-01-01T00:00:00Z"},
+            {"slug": "new", "active": False, "updated_at": "2026-09-09T00:00:00Z"},
+        ]
+        self.assertEqual(hr.pick_session(rows)["slug"], "new")
+
+    def test_newest_among_several_active(self):
+        rows = [
+            {"slug": "a", "active": True, "updated_at": "2026-01-01T00:00:00Z"},
+            {"slug": "b", "active": True, "updated_at": "2026-02-02T00:00:00Z"},
+        ]
+        self.assertEqual(hr.pick_session(rows)["slug"], "b")
+
+    def test_empty_is_none(self):
+        self.assertIsNone(hr.pick_session([]))
+        self.assertIsNone(hr.pick_session(None))
+
+
+class TuicrReadTests(unittest.TestCase):
+    """Parsers for the tuicr review CLI. Malformed output must fail closed:
+    returning None keeps the notes retryable, while a wrong guess would
+    silently consume or mis-deliver them."""
+
+    def test_sessions_scopes_by_repo_and_parses_rows(self):
+        seen = []
+
+        def tuicr(*args):
+            seen.append(args)
+            return '[{"slug": "s1", "active": true}]'
+
+        rows = hr.tuicr_sessions("/repo", tuicr=tuicr)
+        self.assertEqual(rows, [{"slug": "s1", "active": True}])
+        self.assertEqual(seen[0], ("review", "list", "--repo", "/repo"))
+
+    def test_sessions_without_repo_lists_every_session(self):
+        # The sent-record GC is global, so it must not use a repo-scoped list.
+        seen = []
+
+        def tuicr(*args):
+            seen.append(args)
+            return "[]"
+
+        hr.tuicr_sessions(tuicr=tuicr)
+        self.assertEqual(seen[0], ("review", "list", "--all"))
+
+    def test_sessions_failure_and_malformed_output_are_none(self):
+        self.assertIsNone(hr.tuicr_sessions("/repo", tuicr=lambda *a: None))
+        self.assertIsNone(hr.tuicr_sessions("/repo", tuicr=lambda *a: "not json"))
+        self.assertIsNone(hr.tuicr_sessions("/repo", tuicr=lambda *a: '{"a": 1}'))
+
+    def test_comments_keeps_only_local_drafts(self):
+        rows = json.dumps([
+            {"id": "c1", "lifecycle_state": "local_draft"},
+            {"id": "c2", "lifecycle_state": "published"},
+            {"id": "c3"},
+        ])
+        got = hr.tuicr_comments("/repo", "slug", tuicr=lambda *a: rows)
+        self.assertEqual([c["id"] for c in got], ["c1"])
+
+    def test_comments_passes_session_and_repo(self):
+        seen = []
+
+        def tuicr(*args):
+            seen.append(args)
+            return "[]"
+
+        hr.tuicr_comments("/repo", "slug", tuicr=tuicr)
+        self.assertEqual(
+            seen[0], ("review", "comments", "--session", "slug", "--repo", "/repo")
+        )
+
+    def test_comments_failure_and_malformed_output_are_none(self):
+        self.assertIsNone(hr.tuicr_comments("/r", "s", tuicr=lambda *a: None))
+        self.assertIsNone(hr.tuicr_comments("/r", "s", tuicr=lambda *a: "nope"))
+        self.assertIsNone(hr.tuicr_comments("/r", "s", tuicr=lambda *a: '{"a": 1}'))
 
 
 def make_fake_herdr(record, agents, neighbors):
@@ -895,38 +968,43 @@ def make_fake_send_input(record, ok=True):
     return send_input
 
 
-def make_fake_hunk(record, session_id, comments, rm_fail=(), rm_snapshots=None):
-    """Low-level run_hunk fake emitting full Hunk 0.18 envelopes (DEC-008)."""
+def make_fake_tuicr(record, sessions, comments):
+    """Low-level run_tuicr fake emitting tuicr review-CLI JSON (DEC-018..021).
 
-    def hunk(*args):
-        record.append(("hunk",) + args)
-        if args[:2] == ("session", "get"):
-            if session_id is None:
-                return None  # observed: rc=1 + stderr when no live session
-            return json.dumps({"session": {"sessionId": session_id}})
-        if args[:3] == ("session", "comment", "list"):
-            return json.dumps({"comments": comments})
-        if args[:3] == ("session", "comment", "rm"):
-            if rm_snapshots is not None:
-                rm_snapshots.append(hr.read_json_state("sent.json", {}))
-            return None if args[-1] in rm_fail else "{}"
-        if args[:2] == ("session", "list"):
-            sessions = [] if session_id is None else [{"sessionId": session_id}]
-            return json.dumps({"sessions": sessions})
+    sessions: rows as `tuicr review list` returns them, or None to simulate a
+    failed listing. comments: rows as `tuicr review comments` returns them."""
+
+    def tuicr(*args):
+        record.append(("tuicr",) + args)
+        if args[:2] == ("review", "list"):
+            if sessions is None:
+                return None
+            return json.dumps(sessions)
+        if args[:2] == ("review", "comments"):
+            if comments is None:
+                return None
+            return json.dumps(comments)
         return ""
 
-    return hunk
+    return tuicr
 
 
 class SendNotesTests(StateDirTestCase):
     PANES = [
-        {"pane_id": "w1:pHUNK", "tab_id": "w1:t1", "cwd": "/repo", "focused": True},
+        {"pane_id": "w1:pVIEW", "tab_id": "w1:t1", "cwd": "/repo", "focused": True},
         {"pane_id": "w1:pAGENT", "tab_id": "w1:t1", "cwd": "/repo", "focused": False},
     ]
     AGENTS = [{"pane_id": "w1:pAGENT", "tab_id": "w1:t1", "cwd": "/repo"}]
+    SESSIONS = [
+        {"slug": "repo@main/worktree", "active": True, "updated_at": "2026-01-02T00:00:00Z"}
+    ]
     COMMENTS = [
-        {"noteId": "n1", "filePath": "src/app.py", "oldRange": [10, 12], "newRange": [11, 13], "body": "Rename this."},
-        {"noteId": "n2", "filePath": "README.md", "oldRange": None, "newRange": None, "body": "Tighten intro."},
+        {"id": "c1", "path": "src/app.py", "start_line": 11, "end_line": 13,
+         "comment_type": "issue", "lifecycle_state": "local_draft",
+         "content": "Rename this."},
+        {"id": "c2", "path": "README.md", "start_line": None, "end_line": None,
+         "comment_type": "none", "lifecycle_state": "local_draft",
+         "content": "Tighten intro."},
     ]
 
     @staticmethod
@@ -935,88 +1013,139 @@ class SendNotesTests(StateDirTestCase):
             return "/repo" if args[1].startswith("/repo") else None
         return None
 
-    def run_send(self, record, herdr, hunk, paste=None):
+    def run_send(self, record, herdr, tuicr, paste=None):
         if paste is None:
             paste = make_fake_send_input(record)
         with mock.patch.object(hr, "herdr_pane_list", return_value=self.PANES), \
              mock.patch.object(hr, "run_herdr", herdr), \
-             mock.patch.object(hr, "run_hunk", hunk), \
+             mock.patch.object(hr, "run_tuicr", tuicr), \
              mock.patch.object(hr, "herdr_send_input", paste), \
              mock.patch.object(hr, "run_git", self.fake_git), \
              contextlib.redirect_stderr(io.StringIO()):
             return hr.cmd_send_notes([])
 
-    def test_happy_path_paste_mark_rm_order(self):
-        # AC-009 + pinned call order paste -> mark -> rm.
+    def test_happy_path_pastes_and_marks_without_deleting(self):
+        # AC-009. tuicr has no CLI delete, so the comments survive the send and
+        # the sent record is the only duplicate guard (DEC-021).
         record = []
-        rm_snapshots = []
         herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
-        hunk = make_fake_hunk(
-            record, "sess-1", self.COMMENTS, rm_snapshots=rm_snapshots
-        )
-        rc = self.run_send(record, herdr, hunk)
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        rc = self.run_send(record, herdr, tuicr)
         self.assertEqual(rc, 0)
 
         paste_calls = [c for c in record if c[0] == "paste"]
         self.assertEqual(len(paste_calls), 1)
         self.assertEqual(paste_calls[0][1], "w1:pAGENT")
-        self.assertIn("- src/app.py:11 — Rename this.", paste_calls[0][2])
+        # Range and comment type both survive into the prompt (DEC-020).
+        self.assertIn("- src/app.py:11-13 — [issue] Rename this.", paste_calls[0][2])
         self.assertIn("- README.md — Tighten intro.", paste_calls[0][2])
 
-        rm_calls = [c for c in record if c[:4] == ("hunk", "session", "comment", "rm")]
-        self.assertEqual([c[-1] for c in rm_calls], ["n1", "n2"])
-        # Marking happened before every rm (AC-014 guard).
-        for snapshot in rm_snapshots:
-            self.assertEqual(snapshot.get("sess-1"), ["n1", "n2"])
-        # paste strictly precedes rm in the recorded call sequence.
-        self.assertLess(
-            record.index(paste_calls[0]), record.index(rm_calls[0])
+        self.assertEqual(
+            hr.read_json_state("sent.json", {}), {"repo@main/worktree": ["c1", "c2"]}
         )
-
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertIn(
             "Pasted 2 note(s) into w1:pAGENT — press Enter to send", notifications
         )
 
     def test_no_session_notifies_and_skips_paste(self):
-        # AC-011.
+        # AC-011: nothing was ever reviewed in this repo.
         record = []
         herdr = make_fake_herdr(record, self.AGENTS, {})
-        hunk = make_fake_hunk(record, None, [])
-        rc = self.run_send(record, herdr, hunk)
+        tuicr = make_fake_tuicr(record, [], [])
+        rc = self.run_send(record, herdr, tuicr)
         self.assertEqual(rc, 1)
         self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
-        self.assertTrue(any("no live hunk session" in n for n in notifications))
+        self.assertTrue(any("no tuicr review session" in n for n in notifications))
+
+    def test_session_listing_failure_is_reported(self):
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {})
+        tuicr = make_fake_tuicr(record, None, [])
+        rc = self.run_send(record, herdr, tuicr)
+        self.assertEqual(rc, 1)
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(any("failed to list" in n for n in notifications))
 
     def test_all_sent_notifies_no_new_notes(self):
         # AC-010.
-        hr.write_json_state("sent.json", {"sess-1": ["n1", "n2"]})
+        hr.write_json_state("sent.json", {"repo@main/worktree": ["c1", "c2"]})
         record = []
         herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
-        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
-        rc = self.run_send(record, herdr, hunk)
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        rc = self.run_send(record, herdr, tuicr)
         self.assertEqual(rc, 0)
         self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertIn("No new notes to send", notifications)
 
-    def test_failed_rm_still_marked_second_run_sends_nothing(self):
-        # AC-014: rm failure -> note remains in hunk but is never re-delivered.
+    def test_second_run_after_send_sends_nothing(self):
+        # AC-014: comments stay in tuicr after delivery, so only the sent
+        # record prevents a re-paste.
         record = []
         herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
-        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS, rm_fail={"n1", "n2"})
-        self.assertEqual(self.run_send(record, herdr, hunk), 0)
-        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
-        self.assertTrue(any("failed to remove 2 note(s)" in n for n in notifications))
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        self.assertEqual(self.run_send(record, herdr, tuicr), 0)
 
         record2 = []
         herdr2 = make_fake_herdr(record2, self.AGENTS, {"left": "w1:pAGENT"})
-        hunk2 = make_fake_hunk(record2, "sess-1", self.COMMENTS)
-        self.assertEqual(self.run_send(record2, herdr2, hunk2), 0)
+        tuicr2 = make_fake_tuicr(record2, self.SESSIONS, self.COMMENTS)
+        self.assertEqual(self.run_send(record2, herdr2, tuicr2), 0)
         self.assertEqual([c for c in record2 if c[0] == "paste"], [])
         notifications2 = [c[3] for c in record2 if c[:3] == ("herdr", "notification", "show")]
         self.assertIn("No new notes to send", notifications2)
+
+    def test_published_comments_are_not_sent(self):
+        # Forge-published comments are not the human's local draft notes.
+        published = [dict(self.COMMENTS[0], lifecycle_state="published")]
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        tuicr = make_fake_tuicr(record, self.SESSIONS, published)
+        rc = self.run_send(record, herdr, tuicr)
+        self.assertEqual(rc, 0)
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
+
+    def test_closed_session_fallback_is_named_in_notification(self):
+        # DEC-018: falling back to a non-running session must be visible, or a
+        # stale pick would paste week-old notes with no signal.
+        sessions = [
+            {"slug": "repo@main/worktree", "active": False,
+             "updated_at": "2026-01-01T00:00:00Z"}
+        ]
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        tuicr = make_fake_tuicr(record, sessions, self.COMMENTS)
+        self.assertEqual(self.run_send(record, herdr, tuicr), 0)
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(
+            any("from closed session repo@main/worktree" in n for n in notifications)
+        )
+
+    def test_active_session_notification_omits_source(self):
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        self.assertEqual(self.run_send(record, herdr, tuicr), 0)
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertIn(
+            "Pasted 2 note(s) into w1:pAGENT — press Enter to send", notifications
+        )
+
+    def test_live_session_wins_over_newer_stale_one(self):
+        # DEC-018: the running viewer is the target even when another session
+        # file was touched more recently.
+        sessions = [
+            {"slug": "stale", "active": False, "updated_at": "2026-09-09T00:00:00Z"},
+            {"slug": "live", "active": True, "updated_at": "2026-01-01T00:00:00Z"},
+        ]
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        tuicr = make_fake_tuicr(record, sessions, self.COMMENTS)
+        self.assertEqual(self.run_send(record, herdr, tuicr), 0)
+        asked = [c for c in record if c[:2] == ("tuicr", "review") and c[2] == "comments"]
+        self.assertEqual(asked[0][4], "live")
 
     def test_concurrent_send_blocked_by_lock(self):
         # Race guard: a second invocation while one holds the claim must not
@@ -1027,8 +1156,8 @@ class SendNotesTests(StateDirTestCase):
 
         record = []
         herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
-        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
-        rc = self.run_send(record, herdr, hunk)
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        rc = self.run_send(record, herdr, tuicr)
         self.assertEqual(rc, 1)
         self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
@@ -1044,8 +1173,8 @@ class SendNotesTests(StateDirTestCase):
         ]
         record = []
         herdr = make_fake_herdr(record, agents, {})
-        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
-        rc = self.run_send(record, herdr, hunk)
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        rc = self.run_send(record, herdr, tuicr)
         self.assertEqual(rc, 1)
         self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
@@ -1054,18 +1183,14 @@ class SendNotesTests(StateDirTestCase):
         )
 
     def test_paste_failure_marks_nothing(self):
-        # Delivery failure must leave notes unmarked and un-removed so the
-        # next invocation retries them.
+        # Delivery failure must leave notes unmarked so the next run retries.
         record = []
         herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
-        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
         paste = make_fake_send_input(record, ok=False)
-        rc = self.run_send(record, herdr, hunk, paste=paste)
+        rc = self.run_send(record, herdr, tuicr, paste=paste)
         self.assertEqual(rc, 1)
         self.assertEqual(hr.read_json_state("sent.json", {}), {})
-        self.assertEqual(
-            [c for c in record if c[:4] == ("hunk", "session", "comment", "rm")], []
-        )
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertTrue(any("failed to paste" in n for n in notifications))
 
@@ -1096,7 +1221,7 @@ class SendInputTests(unittest.TestCase):
         self.addCleanup(thread.join, 5)
         return path, received
 
-    OK_REPLY = b'{"id":"hunk-review:send-input","result":{"type":"ok"}}\n'
+    OK_REPLY = b'{"id":"herdr-review:send-input","result":{"type":"ok"}}\n'
 
     def test_sends_pane_send_input_request_and_accepts_ok(self):
         path, received = self.serve_once(self.OK_REPLY)
@@ -1111,7 +1236,7 @@ class SendInputTests(unittest.TestCase):
 
     def test_error_response_is_failure(self):
         path, _ = self.serve_once(
-            b'{"id":"hunk-review:send-input","error":{"code":"pane_not_found"}}\n'
+            b'{"id":"herdr-review:send-input","error":{"code":"pane_not_found"}}\n'
         )
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
             self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
@@ -1129,13 +1254,13 @@ class SendInputTests(unittest.TestCase):
             self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
 
     def test_missing_result_is_failure(self):
-        path, _ = self.serve_once(b'{"id":"hunk-review:send-input"}\n')
+        path, _ = self.serve_once(b'{"id":"herdr-review:send-input"}\n')
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
             self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
 
     def test_wrong_result_type_is_failure(self):
         path, _ = self.serve_once(
-            b'{"id":"hunk-review:send-input","result":{"type":"pong"}}\n'
+            b'{"id":"herdr-review:send-input","result":{"type":"pong"}}\n'
         )
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
             self.assertFalse(hr.herdr_send_input("w1:p2", "text"))

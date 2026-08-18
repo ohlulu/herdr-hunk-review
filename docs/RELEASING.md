@@ -12,7 +12,7 @@ Releases follow the user-level `release-flow` skill, channel `tag-ci`.
 ## Facts
 
 ```yaml
-app: herdr-hunk-review
+app: herdr-review
 channel: tag-ci
 
 gate: python3 -m unittest discover -s tests

@@ -1,15 +1,15 @@
 ---
-summary: Requirements for the herdr-hunk-review plugin MVP (picker-driven hunk review pane + note roundtrip to agent)
+summary: Requirements for the herdr-review plugin MVP (picker-driven tuicr review pane + note roundtrip to agent)
 read_when:
   - Implementing or verifying the MVP plugin behavior
   - Deciding whether a behavior change is in scope
 ---
 
-# herdr-hunk-review — Requirements
+# herdr-review — Requirements
 
 ## Summary
 
-herdr plugin：`cmd+shift+h` 在當前 tab 開一個 picker pane 選 review target 後就地變成 hunk viewer；`cmd+shift+s` 把 hunk 裡人寫的 inline note 一次貼進隔壁 agent pane 的輸入框成為可編輯的 draft（不自動送出，由人按 Enter），並從 hunk 清除。
+herdr plugin：`cmd+shift+h` 在當前 tab 開一個 picker pane 選 review target 後就地變成 tuicr viewer；`cmd+shift+s` 把 tuicr 裡人寫的 inline comment 一次貼進隔壁 agent pane 的輸入框成為可編輯的 draft（不自動送出，由人按 Enter）。
 
 ## Requirements
 
@@ -37,7 +37,7 @@ The picker SHALL list review targets in this order — merge base, uncommitted, 
 | 選項 | 內容 |
 |------|------|
 | Merge base | `<base>...HEAD`（merge-base diff，不含未 commit 變動） |
-| Uncommitted | staged + unstaged 相對 HEAD 的全部變動，live（`--watch`） |
+| Uncommitted | staged + unstaged 相對 HEAD 的全部變動，snapshot（tuicr 無 watch 模式） |
 | Last commit | HEAD 這個 commit |
 | Pick commit | fzf 瀏覽 `git log` 選一個 commit |
 | Pick range | 兩輪 fzf：`old>` 選範圍舊端，`new>` 只列比 old 新的 commits 加首列 `(worktree)`（預設，選它則 diff old 至工作樹），diff `old..new` |
@@ -58,31 +58,33 @@ Known limitation: a child forked from a mid-chain commit after this branch advan
 | AC-018 | parent branch 本地已刪、只剩 `origin/feature-a` | 解析 base | base 為 `origin/feature-a` |
 | AC-019 | stack `main ← feature-a ← feature-b ← feature-c`，站在 `feature-b`（child `feature-c` 包含 HEAD） | 解析 base | base 為 `feature-a`；child 不參與 fork-point 計算與標籤 |
 
-### REQ-004: Session reuse
+### REQ-004: Viewer reuse
 
-IF a live hunk session already exists for the repository, WHEN a picker target is confirmed, the plugin SHALL reload that session in place, focus its pane, and close the picker pane instead of opening a second viewer.
+IF a viewer pane is already recorded for the repository, WHEN a picker target is confirmed, the plugin SHALL close that pane so the picker pane becomes the single viewer for the repository.
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-007 | repo 已有開著的 hunk review pane | picker 確認任一 target | 原 review pane 內容更新為新 target 並取得 focus，picker pane 消失 |
+| AC-007 | repo 已有開著的 review pane | picker 確認任一 target | 舊 review pane 關閉，picker pane 就地變成新 target 的 viewer，該 repo 仍只有一個 viewer |
 
 ### REQ-005: Viewer launch
 
-WHEN a target is confirmed and no live session exists, the picker SHALL `exec` hunk with that target's arguments, so the picker pane itself becomes the review pane.
+WHEN a target is confirmed, the picker SHALL `exec` tuicr with that target's arguments, so the picker pane itself becomes the review pane.
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-008 | 無既有 session | 選 `Uncommitted` | 同一個 pane 變成 `hunk diff HEAD --watch` 的 viewer |
+| AC-008 | 選 `Uncommitted` | 確認 | 同一個 pane 變成 `tuicr -w` 的 viewer |
 
 ### REQ-006: Send notes
 
-WHEN the user invokes the `send-notes` action (cmd+shift+s), the plugin SHALL paste all unsent user-authored hunk notes of the focused pane's repository into the resolved agent pane's input as one prompt draft — without submitting it — then remove the delivered notes from hunk. The human reviews, optionally edits, and submits the draft themselves. A draft the human discards is not re-sendable (pasted = delivered).
+WHEN the user invokes the `send-notes` action (cmd+shift+s), the plugin SHALL paste all unsent local-draft comments of the focused pane's repository into the resolved agent pane's input as one prompt draft — without submitting it. The human reviews, optionally edits, and submits the draft themselves. A draft the human discards is not re-sendable (pasted = delivered). Delivered comments stay in tuicr as the review record; the sent-id log is the only duplicate guard.
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-009 | hunk session 有 2 條未送 user note，隔壁 pane 是 agent | 觸發 send-notes | agent pane 輸入框出現一份含兩條 `file:line — body` 的 draft，未送出；兩條 note 從 hunk 消失；notification 顯示 `Pasted 2 note(s) into … — press Enter to send` |
-| AC-010 | 無未送 note | 觸發 send-notes | notification `No new notes to send`，不碰 agent pane |
-| AC-011 | 該 repo 無 live hunk session | 觸發 send-notes | notification 說明無 session，不碰 agent pane |
+| AC-009 | tuicr session 有 2 條未送 comment，隔壁 pane 是 agent | 觸發 send-notes | agent pane 輸入框出現一份含兩條 `path:lines — content` 的 draft，未送出；notification 顯示 `Pasted 2 note(s) into … — press Enter to send` |
+| AC-010 | 無未送 comment | 觸發 send-notes | notification `No new notes to send`，不碰 agent pane |
+| AC-011 | 該 repo 無任何 tuicr session | 觸發 send-notes | notification 說明無 session，不碰 agent pane |
+| AC-020 | comment 跨 L10–L14（visual mode 建立） | 觸發 send-notes | draft 該列為 `path:10-14 — …`，範圍不塌成單行 |
+| AC-021 | comment 已 publish 到 forge（非 local draft） | 觸發 send-notes | 該則不進 draft |
 
 ### REQ-007: Agent target resolution
 
@@ -90,16 +92,17 @@ The plugin SHALL resolve the receiving agent in this order: (1) the focused pane
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-012 | focused 是 hunk pane，agent pane 在左鄰 | 觸發 send-notes | note 送到左鄰 agent |
+| AC-012 | focused 是 viewer pane，agent pane 在左鄰 | 觸發 send-notes | note 送到左鄰 agent |
 | AC-013 | 四鄰皆非 agent，同 tab 有兩個同 repo 的 agent pane | 觸發 send-notes | 不送；notification 列出候選 pane id 要求使用者站到目標旁再送 |
 
 ### REQ-008: Duplicate suppression
 
-The plugin SHALL record delivered note ids per hunk session id, SHALL exclude recorded ids from later sends, and SHALL drop records whose session no longer exists.
+The plugin SHALL record delivered comment ids per tuicr session slug, SHALL exclude recorded ids from later sends, and SHALL drop records whose session no longer exists.
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-014 | note A 已送出但事後的 `comment rm` 失敗，A 仍在 hunk 裡 | 再次觸發 send-notes | A 不重送（notification 為 no new notes 或僅含其他新 note） |
+| AC-014 | comment A 已送出且仍在 tuicr 裡（tuicr 無 CLI 刪除） | 再次觸發 send-notes | A 不重送（notification 為 no new notes 或僅含其他新 comment） |
+| AC-022 | 兩個 tuicr session 都有未送 comment，其一 viewer 正在執行 | 觸發 send-notes | 取執行中那個 session；皆未執行時取最近更新的，且 notification 註明 `from closed session <slug>` |
 
 ### REQ-009: Keybinding wiring
 
@@ -108,11 +111,12 @@ The keybindings SHALL be hand-written into the tracked configs following the exi
 | AC | Given | When | Then |
 |----|-------|------|------|
 | AC-015 | 兩份 config 改完並 `herdr server reload-config` | 在 kitty 按 cmd+shift+h | picker pane 開啟（全鏈路） |
-| AC-016 | 同上 | 在 hunk pane 按 cmd+shift+s | send-notes 動作執行（herdr 攔截，hunk TUI 不收到該鍵） |
+| AC-016 | 同上 | 在 tuicr pane 按 cmd+shift+s | send-notes 動作執行（herdr 攔截，tuicr TUI 不收到該鍵） |
 
 ## Out of Scope
 
 - Agent idle 時自動開 diff（JacquesvanWyk autodiff）
 - `Staged`、`Stash` 選單項（可日後加一行）
+- Agent 回寫 comment 到 tuicr（`tuicr review add` 已具備，留待下一輪）
 - git pager 整合、GitHub link handler、managed keybinding block（jhochenbaum 那三套）
 - mbp 端自動部署 — README 記手動安裝步驟，兩台各裝一次

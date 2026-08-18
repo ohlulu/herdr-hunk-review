@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.0.0] - 2026-08-18
+
+Breaking: the plugin id changed from `herdr-hunk-review` to `herdr-review`.
+Update the `command` in your `~/.config/herdr/config.toml` keybindings to
+`herdr-review.review` / `herdr-review.send-notes`, re-link or re-install the
+plugin, then `herdr server reload-config`.
+
+- The viewer is now [tuicr](https://tuicr.dev/) instead of hunk. On the same
+  2.7k-line diff, memory drops from 368MB to 57MB and hunk-to-hunk navigation
+  from ~28ms to ~3.7ms of CPU per jump; hunk's watch mode cost ~112ms of CPU
+  per file change, which made the viewer stutter while an agent was writing
+  files
+- Review comments can span a line range. `v` / `V` in tuicr selects the range
+  and the draft keeps both bounds (`src/main.rs:10-14`); hunk collapsed every
+  note to a single line
+- Comment classifications (`nit`, `issue`, …) are tagged inline in the draft,
+  and file-level and review-level comments are included
+- Delivered comments are no longer deleted from the viewer. tuicr has no CLI
+  delete, and keeping them makes the viewer a durable record of what you
+  raised; `sent.json` remains the duplicate guard
+- `Uncommitted` is now a snapshot instead of a live view — re-open to refresh.
+  tuicr has no watch mode, and watch was the main source of hunk's stutter
+- Picking a target closes the repo's previous viewer pane and takes over,
+  since tuicr has no in-place reload. Sessions persist per target, so
+  returning to a target restores its comments and reviewed state
+- Notes written before a viewer was closed are still sendable: the plugin
+  prefers the running session and falls back to the most recent one
+
 ## [0.3.0] - 2026-08-18
 
 - send-notes now pastes the notes into the agent pane's input as an editable
