@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0] - 2026-08-18
+
+- send-notes now pastes the notes into the agent pane's input as an editable
+  draft instead of submitting them immediately — review, edit, and press
+  Enter yourself. Delivery goes through the herdr daemon's `pane.send_input`
+  API (bracketed paste, no Enter); the CLI's `agent prompt` always submits
+  and `pane send-text` writes raw bytes that a chat TUI may treat as
+  submissions on each newline. Discarding the draft does not restore the
+  notes: pasted counts as delivered
+- Notification wording follows: `Pasted N note(s) into … — press Enter to
+  send`
+
 ## [0.2.0] - 2026-08-18
 
 - Merge base now detects the branch the current branch was forked from

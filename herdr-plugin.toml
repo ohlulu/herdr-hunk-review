@@ -1,8 +1,8 @@
 id = "herdr-hunk-review"
 name = "Hunk Review"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
-description = "Pick a git review target in a split pane, view it in hunk, and send inline review notes back to the neighboring agent pane"
+description = "Pick a git review target in a split pane, view it in hunk, and draft inline review notes into the neighboring agent pane"
 platforms = ["linux", "macos"]
 
 # The pane command's cwd is the --cwd passed at open time (the repo under

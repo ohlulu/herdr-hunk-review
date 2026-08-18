@@ -11,9 +11,11 @@ import io
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -861,7 +863,7 @@ class FilterUnsentTests(unittest.TestCase):
         self.assertEqual(hr.gc_sent(sent, []), {})
 
 
-def make_fake_herdr(record, agents, neighbors, prompt_ok=True):
+def make_fake_herdr(record, agents, neighbors):
     """Low-level run_herdr fake emitting the observed CLI envelopes."""
 
     def herdr(*args):
@@ -876,13 +878,21 @@ def make_fake_herdr(record, agents, neighbors, prompt_ok=True):
             return json.dumps(
                 {"result": {"neighbor": neighbor, "type": "pane_neighbor"}}
             )
-        if args[:2] == ("agent", "prompt"):
-            return "" if prompt_ok else None
         if args[:2] == ("notification", "show"):
             return ""
         return ""
 
     return herdr
+
+
+def make_fake_send_input(record, ok=True):
+    """herdr_send_input fake; records (\"paste\", pane_id, text) calls."""
+
+    def send_input(pane_id, text):
+        record.append(("paste", pane_id, text))
+        return ok
+
+    return send_input
 
 
 def make_fake_hunk(record, session_id, comments, rm_fail=(), rm_snapshots=None):
@@ -925,16 +935,19 @@ class SendNotesTests(StateDirTestCase):
             return "/repo" if args[1].startswith("/repo") else None
         return None
 
-    def run_send(self, record, herdr, hunk):
+    def run_send(self, record, herdr, hunk, paste=None):
+        if paste is None:
+            paste = make_fake_send_input(record)
         with mock.patch.object(hr, "herdr_pane_list", return_value=self.PANES), \
              mock.patch.object(hr, "run_herdr", herdr), \
              mock.patch.object(hr, "run_hunk", hunk), \
+             mock.patch.object(hr, "herdr_send_input", paste), \
              mock.patch.object(hr, "run_git", self.fake_git), \
              contextlib.redirect_stderr(io.StringIO()):
             return hr.cmd_send_notes([])
 
-    def test_happy_path_prompt_mark_rm_order(self):
-        # AC-009 + pinned call order prompt -> mark -> rm.
+    def test_happy_path_paste_mark_rm_order(self):
+        # AC-009 + pinned call order paste -> mark -> rm.
         record = []
         rm_snapshots = []
         herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
@@ -944,36 +957,35 @@ class SendNotesTests(StateDirTestCase):
         rc = self.run_send(record, herdr, hunk)
         self.assertEqual(rc, 0)
 
-        prompt_calls = [c for c in record if c[:3] == ("herdr", "agent", "prompt")]
-        self.assertEqual(len(prompt_calls), 1)
-        self.assertEqual(prompt_calls[0][3], "w1:pAGENT")
-        self.assertIn("- src/app.py:11 — Rename this.", prompt_calls[0][4])
-        self.assertIn("- README.md — Tighten intro.", prompt_calls[0][4])
-        self.assertNotIn("--wait", prompt_calls[0])
+        paste_calls = [c for c in record if c[0] == "paste"]
+        self.assertEqual(len(paste_calls), 1)
+        self.assertEqual(paste_calls[0][1], "w1:pAGENT")
+        self.assertIn("- src/app.py:11 — Rename this.", paste_calls[0][2])
+        self.assertIn("- README.md — Tighten intro.", paste_calls[0][2])
 
         rm_calls = [c for c in record if c[:4] == ("hunk", "session", "comment", "rm")]
         self.assertEqual([c[-1] for c in rm_calls], ["n1", "n2"])
         # Marking happened before every rm (AC-014 guard).
         for snapshot in rm_snapshots:
             self.assertEqual(snapshot.get("sess-1"), ["n1", "n2"])
-        # prompt strictly precedes rm in the recorded call sequence.
+        # paste strictly precedes rm in the recorded call sequence.
         self.assertLess(
-            record.index(prompt_calls[0]), record.index(rm_calls[0])
+            record.index(paste_calls[0]), record.index(rm_calls[0])
         )
 
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
-        self.assertIn("Sent 2 note(s) to w1:pAGENT", notifications)
+        self.assertIn(
+            "Pasted 2 note(s) into w1:pAGENT — press Enter to send", notifications
+        )
 
-    def test_no_session_notifies_and_skips_prompt(self):
+    def test_no_session_notifies_and_skips_paste(self):
         # AC-011.
         record = []
         herdr = make_fake_herdr(record, self.AGENTS, {})
         hunk = make_fake_hunk(record, None, [])
         rc = self.run_send(record, herdr, hunk)
         self.assertEqual(rc, 1)
-        self.assertEqual(
-            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
-        )
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertTrue(any("no live hunk session" in n for n in notifications))
 
@@ -985,9 +997,7 @@ class SendNotesTests(StateDirTestCase):
         hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
         rc = self.run_send(record, herdr, hunk)
         self.assertEqual(rc, 0)
-        self.assertEqual(
-            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
-        )
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertIn("No new notes to send", notifications)
 
@@ -1004,15 +1014,13 @@ class SendNotesTests(StateDirTestCase):
         herdr2 = make_fake_herdr(record2, self.AGENTS, {"left": "w1:pAGENT"})
         hunk2 = make_fake_hunk(record2, "sess-1", self.COMMENTS)
         self.assertEqual(self.run_send(record2, herdr2, hunk2), 0)
-        self.assertEqual(
-            [c for c in record2 if c[:3] == ("herdr", "agent", "prompt")], []
-        )
+        self.assertEqual([c for c in record2 if c[0] == "paste"], [])
         notifications2 = [c[3] for c in record2 if c[:3] == ("herdr", "notification", "show")]
         self.assertIn("No new notes to send", notifications2)
 
     def test_concurrent_send_blocked_by_lock(self):
         # Race guard: a second invocation while one holds the claim must not
-        # prompt the agent a second time.
+        # paste into the agent a second time.
         holder = open(self.state_dir / "send.lock", "w")
         self.addCleanup(holder.close)
         fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1022,9 +1030,7 @@ class SendNotesTests(StateDirTestCase):
         hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
         rc = self.run_send(record, herdr, hunk)
         self.assertEqual(rc, 1)
-        self.assertEqual(
-            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
-        )
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertTrue(any("already in progress" in n for n in notifications))
         # Nothing was marked: the notes stay claimable by the lock holder.
@@ -1041,13 +1047,82 @@ class SendNotesTests(StateDirTestCase):
         hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
         rc = self.run_send(record, herdr, hunk)
         self.assertEqual(rc, 1)
-        self.assertEqual(
-            [c for c in record if c[:3] == ("herdr", "agent", "prompt")], []
-        )
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
         notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
         self.assertTrue(
             any("w1:pA1" in n and "w1:pA2" in n for n in notifications)
         )
+
+    def test_paste_failure_marks_nothing(self):
+        # Delivery failure must leave notes unmarked and un-removed so the
+        # next invocation retries them.
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        hunk = make_fake_hunk(record, "sess-1", self.COMMENTS)
+        paste = make_fake_send_input(record, ok=False)
+        rc = self.run_send(record, herdr, hunk, paste=paste)
+        self.assertEqual(rc, 1)
+        self.assertEqual(hr.read_json_state("sent.json", {}), {})
+        self.assertEqual(
+            [c for c in record if c[:4] == ("hunk", "session", "comment", "rm")], []
+        )
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(any("failed to paste" in n for n in notifications))
+
+
+class SendInputTests(unittest.TestCase):
+    """Wire-level herdr_send_input tests against a real Unix socket, because
+    the NDJSON request shape is exactly what a fake would get wrong."""
+
+    def serve_once(self, reply):
+        """One-shot NDJSON server; returns (socket_path, received_lines)."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "herdr.sock")
+        received = []
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def run():
+            conn, _ = server.accept()
+            with conn, conn.makefile("rb") as reader:
+                received.append(reader.readline())
+                conn.sendall(reply)
+            server.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        return path, received
+
+    def test_sends_pane_send_input_request_and_accepts_ok(self):
+        path, received = self.serve_once(b'{"id":"x","result":{"type":"ok"}}\n')
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertTrue(hr.herdr_send_input("w1:p2", "line one\nline two"))
+        request = json.loads(received[0])
+        self.assertEqual(request["method"], "pane.send_input")
+        # No "keys" entry: the server must not press Enter on the draft.
+        self.assertEqual(
+            request["params"], {"pane_id": "w1:p2", "text": "line one\nline two"}
+        )
+
+    def test_error_response_is_failure(self):
+        path, _ = self.serve_once(b'{"id":"x","error":{"code":"pane_not_found"}}\n')
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
+
+    def test_missing_socket_env_is_failure(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERDR_SOCKET_PATH", None)
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
+
+    def test_dead_socket_path_is_failure(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "gone.sock")
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
 
 
 # Keep this at the true end of file: unittest.main() exits the process, so a

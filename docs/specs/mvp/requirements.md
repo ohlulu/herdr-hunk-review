@@ -9,7 +9,7 @@ read_when:
 
 ## Summary
 
-herdr plugin：`cmd+shift+h` 在當前 tab 開一個 picker pane 選 review target 後就地變成 hunk viewer；`cmd+shift+s` 把 hunk 裡人寫的 inline note 一次送回隔壁 agent pane 並清除。
+herdr plugin：`cmd+shift+h` 在當前 tab 開一個 picker pane 選 review target 後就地變成 hunk viewer；`cmd+shift+s` 把 hunk 裡人寫的 inline note 一次貼進隔壁 agent pane 的輸入框成為可編輯的 draft（不自動送出，由人按 Enter），並從 hunk 清除。
 
 ## Requirements
 
@@ -76,13 +76,13 @@ WHEN a target is confirmed and no live session exists, the picker SHALL `exec` h
 
 ### REQ-006: Send notes
 
-WHEN the user invokes the `send-notes` action (cmd+shift+s), the plugin SHALL deliver all unsent user-authored hunk notes of the focused pane's repository to the resolved agent pane as one prompt, then remove the delivered notes from hunk.
+WHEN the user invokes the `send-notes` action (cmd+shift+s), the plugin SHALL paste all unsent user-authored hunk notes of the focused pane's repository into the resolved agent pane's input as one prompt draft — without submitting it — then remove the delivered notes from hunk. The human reviews, optionally edits, and submits the draft themselves. A draft the human discards is not re-sendable (pasted = delivered).
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-009 | hunk session 有 2 條未送 user note，隔壁 pane 是 agent | 觸發 send-notes | agent 收到一則含兩條 `file:line — body` 的 prompt；兩條 note 從 hunk 消失；notification 顯示 `Sent 2 note(s) to …` |
-| AC-010 | 無未送 note | 觸發 send-notes | notification `No new notes to send`，不 prompt agent |
-| AC-011 | 該 repo 無 live hunk session | 觸發 send-notes | notification 說明無 session，不 prompt agent |
+| AC-009 | hunk session 有 2 條未送 user note，隔壁 pane 是 agent | 觸發 send-notes | agent pane 輸入框出現一份含兩條 `file:line — body` 的 draft，未送出；兩條 note 從 hunk 消失；notification 顯示 `Pasted 2 note(s) into … — press Enter to send` |
+| AC-010 | 無未送 note | 觸發 send-notes | notification `No new notes to send`，不碰 agent pane |
+| AC-011 | 該 repo 無 live hunk session | 觸發 send-notes | notification 說明無 session，不碰 agent pane |
 
 ### REQ-007: Agent target resolution
 

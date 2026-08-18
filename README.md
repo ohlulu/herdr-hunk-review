@@ -3,8 +3,9 @@
 A [herdr](https://herdr.dev) plugin that turns code review into a
 two-key loop: `cmd+shift+h` opens a picker pane that becomes a
 [hunk](https://hunk.dev/) diff viewer for the target you choose;
-`cmd+shift+s` sends every inline note you wrote in hunk to the agent pane sitting
-next to it, as one prompt, and clears them from the viewer.
+`cmd+shift+s` pastes every inline note you wrote in hunk into the neighboring
+agent pane's input as one editable draft — you press Enter to send it — and
+clears them from the viewer.
 
 Single stdlib-only Python script, no build step.
 
@@ -21,7 +22,7 @@ command to upgrade. To stay on a released version instead, pin its tag —
 `herdr plugin list` then shows the version rather than a commit:
 
 ```sh
-herdr plugin install ohlulu/herdr-hunk-review --ref v0.2.0
+herdr plugin install ohlulu/herdr-hunk-review --ref v0.3.0
 ```
 
 For development, link a checkout instead — nothing is copied, edits are live,
@@ -68,7 +69,7 @@ included) never sees the key. In other terminals use the `prefix+alt+h/s` or
 | Key | Action |
 |-----|--------|
 | `cmd+shift+h` (kitty) · `prefix+alt+h` · `ctrl+alt+shift+h` | Open the review target picker |
-| `cmd+shift+s` (kitty) · `prefix+alt+s` · `ctrl+alt+shift+s` | Send hunk notes to the agent pane |
+| `cmd+shift+s` (kitty) · `prefix+alt+s` · `ctrl+alt+shift+s` | Draft hunk notes into the agent pane |
 
 ## Review targets
 
@@ -88,20 +89,26 @@ place (and focuses it), or — when there is none — the picker pane itself
 
 Esc anywhere closes the picker with no side effects.
 
-## Sending notes
+## Drafting notes
 
 `cmd+shift+s` collects the repository's unsent user-authored hunk notes and
-delivers them to one agent pane as a single prompt
-(`file:line — body` per note), then removes them from hunk and reports
-`Sent N note(s) to …`. Nothing to send → `No new notes to send`; no live hunk
-session → a notification says so and no agent is prompted.
+pastes them into one agent pane's input as a single prompt draft
+(`file:line — body` per note) without submitting it — review, edit, and press
+Enter yourself. The notes are then removed from hunk and a notification
+reports `Pasted N note(s) into … — press Enter to send`. Nothing to send →
+`No new notes to send`; no live hunk session → a notification says so and the
+agent pane is untouched.
+
+Pasted counts as delivered: discarding the draft in the composer does not put
+the notes back — they are already recorded in `sent.json` and cleared from
+hunk.
 
 Agent resolution order:
 
 1. The focused pane itself, when it hosts an agent.
 2. The first neighboring agent pane, probing left, right, up, down.
 3. The only agent pane in the current tab whose cwd is inside the same
-   repository — with zero or several candidates the send aborts and a
+   repository — with zero or several candidates the draft aborts and a
    notification lists the candidate pane ids; move next to the target agent
    and retry.
 

@@ -5,8 +5,8 @@ Subcommands:
   open-picker  action: open the picker pane in the current tab (REQ-001)
   picker       pane entrypoint: fzf target picker that becomes the hunk viewer
                (REQ-002..005)
-  send-notes   action: deliver unsent user hunk notes to the resolved agent
-               pane (REQ-006..008)
+  send-notes   action: paste unsent user hunk notes into the resolved agent
+               pane's input as one editable draft (REQ-006..008)
 
 Design (DEC-001, DEC-002): single stdlib-only file. Pure decision functions
 take injected runner callables; subprocess glue stays thin so tests never
@@ -17,6 +17,7 @@ import fcntl
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -137,6 +138,43 @@ def herdr_neighbor_id(pane_id, direction):
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
 
+
+
+def herdr_send_input(pane_id, text):
+    """Paste text into a pane's input WITHOUT submitting it; True on success.
+
+    Speaks the daemon's newline-delimited JSON API directly because no herdr
+    0.8 CLI verb covers this: `pane send-text` writes raw bytes (a chat TUI
+    may treat embedded newlines as submissions), while `agent prompt` and
+    `pane run` append Enter. `pane.send_input` with no keys goes through the
+    server's bracketed-paste encoding, so multi-line text lands in the
+    composer exactly like a human paste. HERDR_SOCKET_PATH is injected into
+    plugin action environments by the server. A protocol change in a future
+    herdr surfaces here as an error response, not a silent misdelivery."""
+    socket_path = os.environ.get("HERDR_SOCKET_PATH")
+    if not socket_path:
+        return False
+    request = json.dumps(
+        {
+            "id": "hunk-review:send-input",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": text},
+        }
+    )
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(socket_path)
+            conn.sendall(request.encode("utf-8") + b"\n")
+            with conn.makefile("rb") as reader:
+                line = reader.readline()
+    except OSError:
+        return False
+    try:
+        response = json.loads(line.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(response, dict) and "error" not in response
 
 def fail_action(message):
     """DEC-011: action-layer failure -> notification + stderr, exit 1."""
@@ -721,8 +759,8 @@ def resolve_agent_for(focused_pane, repo):
 def acquire_send_lock():
     """Claim the send flow across processes, or None when already claimed.
 
-    The duplicate guard is read sent.json -> prompt -> write sent.json; two
-    overlapping invocations racing that window would each deliver the same
+    The duplicate guard is read sent.json -> paste -> write sent.json; two
+    overlapping invocations racing that window would each paste the same
     notes. flock serializes the whole flow and releases on process exit, so
     a crashed sender never wedges the next one. The caller must keep the
     returned file object referenced while sending."""
@@ -736,8 +774,8 @@ def acquire_send_lock():
 
 
 def cmd_send_notes(args):
-    """Action: deliver unsent user hunk notes to the resolved agent pane
-    (REQ-006..008, DEC-008..011)."""
+    """Action: paste unsent user hunk notes into the resolved agent pane's
+    input as one editable draft (REQ-006..008, DEC-008..011, DEC-014)."""
     focused = None
     for pane in herdr_pane_list() or []:
         if pane.get("focused"):
@@ -794,12 +832,14 @@ def cmd_send_notes(args):
         return fail_action("hunk-review: no agent pane found")
 
     prompt = format_prompt(repo, unsent)
-    # No --wait: fire-and-forget so the action returns immediately (DEC-009).
-    if run_herdr("agent", "prompt", agent_pane, prompt) is None:
-        return fail_action("hunk-review: failed to prompt agent")
+    # Draft, not submit: the human reviews/edits in the composer and presses
+    # Enter themselves (DEC-014).
+    if not herdr_send_input(agent_pane, prompt):
+        return fail_action("hunk-review: failed to paste notes into agent pane")
 
     # Mark BEFORE comment rm: if rm fails the note stays visible in hunk but
-    # must never be delivered twice (AC-014).
+    # must never be pasted twice (AC-014). Pasted = delivered — a draft the
+    # human later discards is not re-sendable (documented in README).
     delivered = [note.get("noteId") for note in unsent]
     sent.setdefault(session_id, []).extend(delivered)
     live = hunk_live_session_ids()
@@ -821,7 +861,11 @@ def cmd_send_notes(args):
             f"hunk-review: failed to remove {len(failed_rm)} note(s) from hunk",
         )
 
-    run_herdr("notification", "show", f"Sent {len(unsent)} note(s) to {agent_pane}")
+    run_herdr(
+        "notification",
+        "show",
+        f"Pasted {len(unsent)} note(s) into {agent_pane} — press Enter to send",
+    )
     return 0
 
 

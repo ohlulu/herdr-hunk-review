@@ -12,7 +12,7 @@ read_when:
 - 單一 Python 3 stdlib script `scripts/hunk_review.py`，以 subcommand 分工：`open-picker`（action，開 pane）、`picker`（pane 內互動）、`send-notes`（action）。
 - picker pane 由 `herdr plugin pane open` 開出（placement split、direction right、focus），pane 內 fzf 選完 target 後 `os.execvp` 成 hunk，pane 即 viewer。
 - 已有 hunk session 時走 `hunk session reload`，picker pane 功成身退（exit 0 自關）。
-- send-notes 全走查證過的 pull 介面：`hunk session get / comment list --type user / comment rm` + `herdr pane neighbor / agent list / agent prompt`。
+- send-notes 全走查證過的 pull 介面：`hunk session get / comment list --type user / comment rm` + `herdr pane neighbor / agent list`；投遞改走 daemon API `pane.send_input`（DEC-014，draft 貼入不送出）。
 - 狀態檔兩個（sent ids、repo→pane 映射）放 `HERDR_PLUGIN_STATE_DIR`，JSON、原子寫入（temp + rename）。
 
 ## Decisions
@@ -99,7 +99,7 @@ id = "send-notes"
 
 ### DEC-009: Agent resolution implementation
 
-- Choice: 依 REQ-007 順序：(1) `herdr agent list` 內含 focused pane id → 送它；(2) `herdr pane neighbor --direction left|right|up|down --pane <focused>` 依序，pane id 在 agent list 內即中；(3) `herdr pane list` 過濾同 tab 且 agent 非 null 且 `git -C cwd rev-parse --show-toplevel` == repo，恰一個即中；否則 `herdr notification show` 列候選。送出用 `herdr agent prompt <pane_id> <text>`（不 `--wait`，fire-and-forget）。
+- Choice: 依 REQ-007 順序：(1) `herdr agent list` 內含 focused pane id → 選它；(2) `herdr pane neighbor --direction left|right|up|down --pane <focused>` 依序，pane id 在 agent list 內即中；(3) `herdr pane list` 過濾同 tab 且 agent 非 null 且 `git -C cwd rev-parse --show-toplevel` == repo，恰一個即中；否則 `herdr notification show` 列候選。投遞走 DEC-014 的 draft 貼入，非 `herdr agent prompt`。
 - Rationale: 空間關係優先（使用者語義「隔壁」），repo 匹配兜底；多候選寧可失敗要求使用者站位，不猜。
 - Satisfies: REQ-006、REQ-007。
 
@@ -116,7 +116,7 @@ Human inline review comments on your changes in {worktree}:
 Address each comment and verify the result. If a comment is unclear, ask a focused question before proceeding.
 ```
 
-- Rationale: jhochenbaum template 的精簡版；line 取 `newRange[0]`，fallback `oldRange[0]`，再 fallback 省略 `:line`。多行 body 原样保留（`herdr agent prompt` 走 bracketed paste）。
+- Rationale: jhochenbaum template 的精簡版；line 取 `newRange[0]`，fallback `oldRange[0]`，再 fallback 省略 `:line`。多行 body 原样保留（`pane.send_input` 走 bracketed paste，DEC-014）。
 - Satisfies: REQ-006。
 
 ### DEC-011: Error reporting
@@ -136,6 +136,13 @@ Address each comment and verify the result. If a comment is unclear, ask a focus
 - Rationale: stacked branch（feature-b 從 feature-a 開出）先前落到 `origin/HEAD`/`main`，diff 把 parent 的 commits 一併捲進來；git 沒有 parent-branch metadata，first-parent 鏈上第一個被其他 branch 包含的 commit 就是 fork point，含有它的 ref 即 parent 候選；排除自身 remote copy 是 AC-006 的廣義化（否則 pushed branch 永遠 diff 到只剩 unpushed commits）；排除含 HEAD 的 refs 是同一邏輯對 child 方向的對稱式（code review 指出的 P1：活的 stack 中 child 常駐 tip，不排除則原 bug 復發）。已知限制：child 從我方鏈中途 commit 開出、我方其後續有新 commit 時，單靠 reachability 無法與 parent 區分（方向資訊只存在於未被記錄的創建事件）；選單標籤會顯示勝出的 ref，使用者可用 branch-vs-branch 或 `--set-upstream-to=<parent>`（REQ-003 第一優先）明確指定。
 - Satisfies: REQ-003 AC-006、AC-017–AC-019。
 
+### DEC-014: Draft 投遞——daemon API `pane.send_input`（2026-08-18）
+
+- Choice: send-notes 投遞從 `herdr agent prompt`（bracketed paste + Enter，直接送出）改為直接對 herdr daemon 發 NDJSON request：`{"method": "pane.send_input", "params": {"pane_id", "text"}}`（無 `keys`），Unix socket 路徑取 `HERDR_SOCKET_PATH`（server 注入 plugin action 環境，runtime.rs）。server 端經 `encode_api_text` 依 pane app 的 bracketed-paste 狀態包 `\x1b[200~…\x1b[201~`，多行文字落地等同人手貼上，不送 Enter —— 使用者在 composer 微調後自行送出。Python 側新增 stdlib `socket`（DEC-001 精神不變）。
+- Alternatives: `herdr pane send-text`（raw bytes 直寫 PTY，無 bracketed paste，多行 `\n` 可能被 chat TUI 當成送出，v0.8.0 原碼 handle_pane_send_text 實證）；`herdr pane run` / `agent prompt`（都追加 Enter）；等 herdr CLI 新增 paste-without-enter 動詞（master 尚無）。
+- Rationale: 使用者要求送出前可微調；`pane.send_input` 是 `agent prompt` 同一條編碼路徑減去 Enter，行為保證相同。已知取捨：(1) pasted = delivered，人在 composer 丟棄 draft 則這批 note 不可重送（sent.json 已記錄、hunk 已清除）；(2) 繞過 CLI 的 protocol guard，未來 herdr 換 wire 形狀時以 error response / 連線失敗顯現，notification 可見。
+- Satisfies: REQ-006 AC-009。
+
 ## Change Map
 
 | File | Action | REQ |
@@ -154,7 +161,7 @@ Address each comment and verify the result. If a comment is unclear, ask a focus
 - `herdr plugin action invoke review --plugin herdr-hunk-review` → picker pane 開啟（AC-001）；非 git cwd pane 觸發 → AC-002。
 - `hunk diff HEAD` 語義實測：staged-only 變動要出現（DEC-005 note）。
 - 選單六項逐一確認 argv / reload（AC-004..008；用測試 repo 造 upstream-self、無 base、stacked + child、remote-only parent 等情境驗 AC-005、AC-006、AC-017–019）。
-- send 全鏈路：hunk TUI 手動加 note → cmd+shift+s → agent pane 收到 prompt、note 消失、再按一次得 no-new-notes（AC-009、010、014）。
+- send 全鏈路：hunk TUI 手動加 note → cmd+shift+s → agent pane 輸入框出現 draft（未送出）、note 消失、再按一次得 no-new-notes（AC-009、010、014）。
 - `herdr server reload-config` 後 kitty 全鏈路（AC-015、016）。
 
 ## Review Dispositions
