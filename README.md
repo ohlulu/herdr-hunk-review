@@ -79,11 +79,11 @@ place (and focuses it), or — when there is none — the picker pane itself
 
 | Target | Shows |
 |--------|-------|
-| Merge base | `<base>...HEAD` — your branch since it diverged from the base; base resolves via `@{u}` (skipped when it is this branch's own remote-tracking ref), then `origin/HEAD`, then `main` / `master` / `trunk`; row hidden when nothing resolves |
+| Merge base | `<base>...HEAD` — your branch since it diverged from the base; base resolves via a non-own-tracking `@{u}`, then fork-parent detection (the nearest branch this one was forked from, so stacked branches review against their parent instead of the repo default branch), then `origin/HEAD`, then `main` / `master` / `trunk`; row hidden when nothing resolves |
 | Uncommitted | Staged + unstaged changes vs `HEAD`, live (`--watch`) |
 | Last commit | The `HEAD` commit |
 | Pick commit | fzf over `git log`, view one commit |
-| Pick range | fzf with two marks → `old..new`; one mark → that commit vs the worktree |
+| Pick range | Two fzf rounds: `old>` picks the range base, `new>` picks the newer end among commits above it — or the leading `(worktree)` row (default) for that commit vs the worktree → `old..new` |
 | Branch vs branch | Two fzf rounds (`base>`, then `compare>`) → `base...compare` |
 
 Esc anywhere closes the picker with no side effects.

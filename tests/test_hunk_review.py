@@ -182,6 +182,105 @@ class ResolveBaseTests(unittest.TestCase):
         self.assertIsNone(hr.resolve_base(fake_git({})))
 
 
+FORK_SHA = "bb3671a750deba4a775ef59b76ef6f22a2a92523"
+
+
+class ResolveForkParentTests(unittest.TestCase):
+    """Stacked branches must review against their fork parent, not the repo
+    default branch."""
+
+    def test_stacked_branch_resolves_fork_parent(self):
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature-b",
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-a\nrefs/heads/feature-b\nrefs/heads/main",
+                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
+                 "refs/heads/feature-a", "refs/heads/main"): "3",
+                ("rev-parse", "HEAD~3"): FORK_SHA,
+                ("for-each-ref", "--format=%(refname) %(objectname)",
+                 "--contains", FORK_SHA, "refs/heads", "refs/remotes"):
+                    f"refs/heads/feature-a {FORK_SHA}\n"
+                    "refs/heads/feature-b 50680de50680de50680de50680de50680de5068",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "feature-a")
+
+    def test_remote_only_parent_wins_and_own_remote_copy_is_excluded(self):
+        # feature-a deleted locally; origin/feature-b (our own pushed copy)
+        # must not shrink the fork point to the unpushed commits (AC-006).
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature-b",
+                ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"):
+                    "origin/feature-b",
+                ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-b\nrefs/heads/main\n"
+                    "refs/remotes/origin/HEAD\nrefs/remotes/origin/feature-a\n"
+                    "refs/remotes/origin/feature-b\nrefs/remotes/origin/main",
+                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
+                 "refs/heads/main", "refs/remotes/origin/feature-a",
+                 "refs/remotes/origin/main"): "4",
+                ("rev-parse", "HEAD~4"): FORK_SHA,
+                ("for-each-ref", "--format=%(refname) %(objectname)",
+                 "--contains", FORK_SHA, "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-b 311f8b9311f8b9311f8b9311f8b9311f8b9311f\n"
+                    f"refs/remotes/origin/feature-a {FORK_SHA}\n"
+                    "refs/remotes/origin/feature-b 50680de50680de50680de50680de50680de5068",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "origin/feature-a")
+
+    def test_unmoved_local_parent_beats_conventional_and_remote_rows(self):
+        rows_out = (
+            f"refs/heads/feature-a {FORK_SHA}\n"
+            "refs/heads/main 4413b2d4413b2d4413b2d4413b2d4413b2d4413\n"
+            f"refs/remotes/origin/feature-a {FORK_SHA}"
+        )
+        git = fake_git(
+            {
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-a\nrefs/heads/main\nrefs/remotes/origin/feature-a",
+                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
+                 "refs/heads/feature-a", "refs/heads/main",
+                 "refs/remotes/origin/feature-a"): "2",
+                ("rev-parse", "HEAD~2"): FORK_SHA,
+                ("for-each-ref", "--format=%(refname) %(objectname)",
+                 "--contains", FORK_SHA, "refs/heads", "refs/remotes"): rows_out,
+            }
+        )
+        self.assertEqual(hr.resolve_fork_parent(git, "feature-b"), "feature-a")
+
+    def test_trunk_branch_skips_fork_detection(self):
+        calls = []
+        responses = {
+            ("rev-parse", "--abbrev-ref", "HEAD"): "main",
+            ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+        }
+
+        def git(*args):
+            calls.append(args)
+            return responses.get(args)
+
+        self.assertEqual(hr.resolve_base(git), "origin/main")
+        self.assertNotIn("for-each-ref", [args[0] for args in calls])
+
+    def test_head_contained_in_another_branch_falls_back(self):
+        # Zero exclusive commits -> empty diff -> not a usable parent.
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature",
+                ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature\nrefs/heads/main",
+                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
+                 "refs/heads/main"): "0",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "origin/main")
+
+
 class BuildMenuTests(unittest.TestCase):
     def test_menu_with_base(self):
         # AC-004: merge-base row first and default.
@@ -310,30 +409,52 @@ class PickerFzfErrorTests(unittest.TestCase):
 
 
 class PickRangeTests(unittest.TestCase):
+    """Two-round old>/new> flow; the retired --multi 2 round needed fzf Tab
+    knowledge and read as "cannot select the second commit"."""
+
     LOG = [
         "\x1b[33mccc333\x1b[m newest commit",
         "\x1b[33mbbb222\x1b[m middle commit",
         "\x1b[33maaa111\x1b[m oldest commit",
     ]
 
-    def test_two_marks_map_to_old_new_by_log_position(self):
-        # fzf --ansi outputs plain lines; order of marks must not matter.
-        for marks in ("ccc333 newest commit\naaa111 oldest commit",
-                      "aaa111 oldest commit\nccc333 newest commit"):
-            with self.subTest(marks=marks):
-                with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
-                     mock.patch.object(hr, "run_fzf", return_value=marks):
-                    self.assertEqual(hr.pick_range_shas(), ("aaa111", "ccc333"))
+    def _run(self, answers):
+        """pick_range_shas() with scripted fzf answers; returns (result, calls)."""
+        calls = []
 
-    def test_single_mark_means_commit_vs_worktree(self):
-        with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
-             mock.patch.object(hr, "run_fzf", return_value="bbb222 middle commit"):
-            self.assertEqual(hr.pick_range_shas(), ("bbb222", None))
+        def fzf(lines, *args):
+            calls.append((list(lines), args))
+            return answers.pop(0)
 
-    def test_cancel_returns_none(self):
         with mock.patch.object(hr, "git_log_lines", return_value=self.LOG), \
-             mock.patch.object(hr, "run_fzf", return_value=None):
-            self.assertIsNone(hr.pick_range_shas())
+             mock.patch.object(hr, "run_fzf", side_effect=fzf):
+            return hr.pick_range_shas(), calls
+
+    def test_two_rounds_map_to_old_new(self):
+        result, calls = self._run(["aaa111 oldest commit", "ccc333 newest commit"])
+        self.assertEqual(result, ("aaa111", "ccc333"))
+        self.assertEqual(calls[0][1], ("--ansi", "--prompt", "old> "))
+        # Round two: only commits newer than old, worktree row first/default.
+        self.assertEqual(calls[1][0], [hr.WORKTREE_ROW, *self.LOG[:2]])
+        self.assertEqual(calls[1][1], ("--ansi", "--prompt", "new> "))
+
+    def test_worktree_row_means_commit_vs_worktree(self):
+        result, _ = self._run(["bbb222 middle commit", hr.WORKTREE_ROW])
+        self.assertEqual(result, ("bbb222", None))
+
+    def test_newest_old_offers_only_worktree(self):
+        result, calls = self._run(["ccc333 newest commit", hr.WORKTREE_ROW])
+        self.assertEqual(result, ("ccc333", None))
+        self.assertEqual(calls[1][0], [hr.WORKTREE_ROW])
+
+    def test_cancel_in_first_round_returns_none(self):
+        result, calls = self._run([None])
+        self.assertIsNone(result)
+        self.assertEqual(len(calls), 1)
+
+    def test_cancel_in_second_round_returns_none(self):
+        result, _ = self._run(["bbb222 middle commit", None])
+        self.assertIsNone(result)
 
 
 class LaunchViewerTests(StateDirTestCase):

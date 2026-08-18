@@ -79,8 +79,8 @@ id = "send-notes"
 
 ### DEC-006: Sub-pickers
 
-- Choice: Pick commit / Pick range 用 `git log --oneline --color=always -200 | fzf --ansi`（range 用 `--multi 2`，git log 新在上，diff `老..新`）；Branch vs branch 用兩輪 fzf（prompt `base>` 再 `compare>`，來源 `git branch -a --format='%(refname:short)' --sort=-committerdate`，`-a` 才會列 remote-tracking branches，濾掉 `origin/HEAD` alias 列），避免猜 `--multi 2` 的輸出順序。子選單按 Esc 直接關 pane（重按 cmd+shift+h 成本低）。
-- Rationale: 沿用 JacquesvanWyk 驗證過的 log picker；branch 比較的方向語義（誰是 base）用兩輪 prompt 消除歧義。
+- Choice: Pick commit / Pick range 用 `git log --oneline --color=always -200 | fzf --ansi`；Pick range 走兩輪（prompt `old>` 選舊端，`new>` 只列比 old 新的 commits 加首列 `(worktree)` 預設項，構造上保證 `old..new` 順序）；Branch vs branch 用兩輪 fzf（prompt `base>` 再 `compare>`，來源 `git branch -a --format='%(refname:short)' --sort=-committerdate`，`-a` 才會列 remote-tracking branches，濾掉 `origin/HEAD` alias 列）。子選單按 Esc 直接關 pane（重按 cmd+shift+h 成本低）。
+- Rationale: 沿用 JacquesvanWyk 驗證過的 log picker；方向語義（誰是舊端 / base）一律用兩輪 prompt 消除歧義。Pick range 原為單輪 `--multi 2`：Tab 標記不可發現，且游標行按 Enter 只回傳已標記項，單標記 fallback 會提前開 viewer，體感為「選不到第二個 commit」——2026-08-18 改為兩輪。
 - Satisfies: REQ-002。
 
 ### DEC-007: Reuse + focus-back
@@ -128,6 +128,13 @@ Address each comment and verify the result. If a comment is unclear, ask a focus
 
 - Choice: kitty `TUI launchers` 區塊加兩行（`\x1b[104;8u`、`\x1b[115;8u`）；herdr config 加兩條 `[[keys.command]]`（`["prefix+alt+h","ctrl+alt+shift+h"]` → `plugin_action herdr-hunk-review.review`；s 同理 → `send-notes`），註解風格照現有 lazygit/yazi 條目。不做 setup-keys managed block。
 - Satisfies: REQ-009。
+
+### DEC-013: Fork-parent base detection（2026-08-18）
+
+- Choice: REQ-003 的 base resolution 在非-own-tracking `@{u}` 之後、`origin/HEAD` 之前插入 fork-parent 偵測，固定 4 次 git 呼叫：(1) `for-each-ref` 列候選 refs（排除當前 branch、各 remote 對它的 copy、remote `HEAD` alias；用 full refname 解析，巢狀 local 名稱如 `feature/x` 不會誤比）；(2) `rev-list --count --first-parent HEAD --not <candidates>` 得專屬 commit 數 k；(3) `HEAD~k` = fork point；(4) `for-each-ref --contains <fork-point>` 找含有它的 refs，優先序：tip == fork point（未移動的 parent）> local > conventional（main/master/trunk）> 名稱字序。k == 0（HEAD 被其他 branch 包含，空 diff）或 `HEAD~k` 不存在（全史專屬）→ 回傳 None 走舊 fallback。在 main/master/trunk 或 `origin/HEAD` 目標 branch 上直接跳過偵測（trunk 沒有 parent）。
+- Alternatives: 逐 branch `merge-base` + distance（N 次呼叫，大 repo 慢）；reflog `Created from`（只記 `HEAD`，不可靠）；`merge-base --fork-point`（需先知道 candidate 且依賴 reflog）。
+- Rationale: stacked branch（feature-b 從 feature-a 開出）先前落到 `origin/HEAD`/`main`，diff 把 parent 的 commits 一併捲進來；git 沒有 parent-branch metadata，first-parent 鏈上第一個被其他 branch 包含的 commit 就是 fork point，含有它的 ref 即 parent 候選；排除自身 remote copy 是 AC-006 的廣義化（否則 pushed branch 永遠 diff 到只剩 unpushed commits）。
+- Satisfies: REQ-003 AC-006、AC-017、AC-018。
 
 ## Change Map
 

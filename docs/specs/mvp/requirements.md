@@ -40,16 +40,20 @@ The picker SHALL list review targets in this order — merge base, uncommitted, 
 | Uncommitted | staged + unstaged 相對 HEAD 的全部變動，live（`--watch`） |
 | Last commit | HEAD 這個 commit |
 | Pick commit | fzf 瀏覽 `git log` 選一個 commit |
-| Pick range | fzf 標記兩個 commit，diff 舊..新（git log 新在上，標記 1 個則 diff 該 commit 至工作樹） |
+| Pick range | 兩輪 fzf：`old>` 選範圍舊端，`new>` 只列比 old 新的 commits 加首列 `(worktree)`（預設，選它則 diff old 至工作樹），diff `old..new` |
 | Branch vs branch | 兩輪 fzf：先選 base branch，再選 compare branch，diff `base...compare` |
 
 ### REQ-003: Base resolution
 
-The plugin SHALL resolve the merge-base ref in this order: `@{u}` (skipped when it is the current branch's own remote-tracking ref), `origin/HEAD`, then the first existing of `main` / `master` / `trunk`.
+The plugin SHALL resolve the merge-base ref in this order: `@{u}` (skipped when it is the current branch's own remote-tracking ref), fork-parent detection (skipped on `main` / `master` / `trunk` and on the `origin/HEAD` target branch), `origin/HEAD`, then the first existing of `main` / `master` / `trunk`.
+
+Fork-parent detection SHALL find the nearest branch the current branch was forked from: walk the first-parent chain to the first commit contained in any other branch (the fork point), then label it with the best containing ref — an unmoved parent (tip == fork point) first, then local over remote, then conventional names. The current branch, every remote's copy of it, and remote `HEAD` aliases SHALL be excluded as candidates.
 
 | AC | Given | When | Then |
 |----|-------|------|------|
-| AC-006 | 當前 branch `feature` 的 upstream 是 `origin/feature` | 解析 base | 跳過 `@{u}`（避免空 diff），落到 `origin/HEAD` 或 conventional branch |
+| AC-006 | 當前 branch `feature` 的 upstream 是 `origin/feature` | 解析 base | 跳過 `@{u}`（避免空 diff），進入 fork-parent 偵測（排除 `origin/feature` 本尊 copy），無果才落到 `origin/HEAD` 或 conventional branch |
+| AC-017 | `feature-b` 從 `feature-a` 開出（stacked branch），兩者皆有後續 commit | 解析 base | base 為 `feature-a`（非 `main`），diff 只含 `feature-b` 自身的 commits |
+| AC-018 | parent branch 本地已刪、只剩 `origin/feature-a` | 解析 base | base 為 `origin/feature-a` |
 
 ### REQ-004: Session reuse
 
