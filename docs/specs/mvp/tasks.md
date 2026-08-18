@@ -8,7 +8,7 @@ read_when:
 # Tasks: herdr-review MVP
 
 > Historical record: this breakdown built the MVP against the hunk viewer. The
-> backend was swapped to tuicr in 1.0.0 (plan DEC-015..021), so task bodies
+> backend was swapped to tuicr in 0.4.0 (plan DEC-015..021), so task bodies
 > below still name hunk commands where they were the implementation target at
 > the time. Requirements and plan carry the current behavior.
 

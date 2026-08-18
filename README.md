@@ -22,7 +22,7 @@ command to upgrade. To stay on a released version instead, pin its tag —
 `herdr plugin list` then shows the version rather than a commit:
 
 ```sh
-herdr plugin install ohlulu/herdr-review --ref v1.0.0
+herdr plugin install ohlulu/herdr-review --ref v0.4.0
 ```
 
 For development, link a checkout instead — nothing is copied, edits are live,

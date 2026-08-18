@@ -1,6 +1,6 @@
 id = "herdr-review"
 name = "Code Review"
-version = "1.0.0"
+version = "0.4.0"
 min_herdr_version = "0.8.0"
 description = "Pick a git review target in a split pane, view it in tuicr, and draft inline review notes into the neighboring agent pane"
 platforms = ["linux", "macos"]
