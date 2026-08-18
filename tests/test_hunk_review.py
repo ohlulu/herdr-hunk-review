@@ -1096,8 +1096,10 @@ class SendInputTests(unittest.TestCase):
         self.addCleanup(thread.join, 5)
         return path, received
 
+    OK_REPLY = b'{"id":"hunk-review:send-input","result":{"type":"ok"}}\n'
+
     def test_sends_pane_send_input_request_and_accepts_ok(self):
-        path, received = self.serve_once(b'{"id":"x","result":{"type":"ok"}}\n')
+        path, received = self.serve_once(self.OK_REPLY)
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
             self.assertTrue(hr.herdr_send_input("w1:p2", "line one\nline two"))
         request = json.loads(received[0])
@@ -1108,7 +1110,33 @@ class SendInputTests(unittest.TestCase):
         )
 
     def test_error_response_is_failure(self):
-        path, _ = self.serve_once(b'{"id":"x","error":{"code":"pane_not_found"}}\n')
+        path, _ = self.serve_once(
+            b'{"id":"hunk-review:send-input","error":{"code":"pane_not_found"}}\n'
+        )
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
+
+    def test_empty_envelope_is_failure(self):
+        # A bare {} carries no acknowledgment; treating it as success would
+        # consume the notes on a misdelivery (review finding, P2).
+        path, _ = self.serve_once(b"{}\n")
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
+
+    def test_mismatched_response_id_is_failure(self):
+        path, _ = self.serve_once(b'{"id":"other","result":{"type":"ok"}}\n')
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
+
+    def test_missing_result_is_failure(self):
+        path, _ = self.serve_once(b'{"id":"hunk-review:send-input"}\n')
+        with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
+            self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
+
+    def test_wrong_result_type_is_failure(self):
+        path, _ = self.serve_once(
+            b'{"id":"hunk-review:send-input","result":{"type":"pong"}}\n'
+        )
         with mock.patch.dict(os.environ, {"HERDR_SOCKET_PATH": path}):
             self.assertFalse(hr.herdr_send_input("w1:p2", "text"))
 

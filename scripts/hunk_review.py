@@ -149,14 +149,17 @@ def herdr_send_input(pane_id, text):
     `pane run` append Enter. `pane.send_input` with no keys goes through the
     server's bracketed-paste encoding, so multi-line text lands in the
     composer exactly like a human paste. HERDR_SOCKET_PATH is injected into
-    plugin action environments by the server. A protocol change in a future
-    herdr surfaces here as an error response, not a silent misdelivery."""
+    plugin action environments by the server. Success requires the exact
+    v0.8.0 envelope (echoed request id + result.type == "ok"): anything
+    else — error response, empty object, protocol drift in a future herdr —
+    fails visibly here instead of silently consuming the notes."""
     socket_path = os.environ.get("HERDR_SOCKET_PATH")
     if not socket_path:
         return False
+    request_id = "hunk-review:send-input"
     request = json.dumps(
         {
-            "id": "hunk-review:send-input",
+            "id": request_id,
             "method": "pane.send_input",
             "params": {"pane_id": pane_id, "text": text},
         }
@@ -174,7 +177,11 @@ def herdr_send_input(pane_id, text):
         response = json.loads(line.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return False
-    return isinstance(response, dict) and "error" not in response
+    if not isinstance(response, dict) or response.get("id") != request_id:
+        return False
+    result = response.get("result")
+    return isinstance(result, dict) and result.get("type") == "ok"
+
 
 def fail_action(message):
     """DEC-011: action-layer failure -> notification + stderr, exit 1."""
