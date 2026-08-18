@@ -30,7 +30,7 @@ The picker SHALL list review targets in this order — merge base, uncommitted, 
 | AC | Given | When | Then |
 |----|-------|------|------|
 | AC-004 | base 解析成功（例 `origin/main`） | 選單顯示 | 第一項顯示 `Merge base (origin/main...HEAD)`，為預設選項 |
-| AC-005 | base 解析失敗（無 upstream / origin/HEAD / main / master / trunk） | 選單顯示 | Merge base 項不出現，`Uncommitted` 成為第一項與預設 |
+| AC-005 | base 解析失敗（無 upstream、fork-parent 偵測無果、無 origin/HEAD / main / master / trunk） | 選單顯示 | Merge base 項不出現，`Uncommitted` 成為第一項與預設 |
 
 各 target 的語義：
 
@@ -47,13 +47,16 @@ The picker SHALL list review targets in this order — merge base, uncommitted, 
 
 The plugin SHALL resolve the merge-base ref in this order: `@{u}` (skipped when it is the current branch's own remote-tracking ref), fork-parent detection (skipped on `main` / `master` / `trunk` and on the `origin/HEAD` target branch), `origin/HEAD`, then the first existing of `main` / `master` / `trunk`.
 
-Fork-parent detection SHALL find the nearest branch the current branch was forked from: walk the first-parent chain to the first commit contained in any other branch (the fork point), then label it with the best containing ref — an unmoved parent (tip == fork point) first, then local over remote, then conventional names. The current branch, every remote's copy of it, and remote `HEAD` aliases SHALL be excluded as candidates.
+Fork-parent detection SHALL find the nearest branch the current branch was forked from: walk the first-parent chain to the first commit contained in any other branch (the fork point), then label it with the best containing ref — an unmoved parent (tip == fork point) first, then local over remote, then conventional names. The current branch, every remote's copy of it (remote prefixes parsed against the configured remote names, which may themselves contain slashes), remote `HEAD` aliases, and every ref that contains `HEAD` (stack children and same-tip twins, which can never be the fork parent) SHALL be excluded as candidates — from both the fork-point race and the labeling. When the `HEAD`-containment probe fails, detection SHALL fail closed into the fallback chain.
+
+Known limitation: a child forked from a mid-chain commit after this branch advanced is indistinguishable from a parent by reachability alone; the menu row shows whichever ref won, and setting an explicit upstream (`git branch --set-upstream-to=<parent>`) overrides detection entirely.
 
 | AC | Given | When | Then |
 |----|-------|------|------|
 | AC-006 | 當前 branch `feature` 的 upstream 是 `origin/feature` | 解析 base | 跳過 `@{u}`（避免空 diff），進入 fork-parent 偵測（排除 `origin/feature` 本尊 copy），無果才落到 `origin/HEAD` 或 conventional branch |
 | AC-017 | `feature-b` 從 `feature-a` 開出（stacked branch），兩者皆有後續 commit | 解析 base | base 為 `feature-a`（非 `main`），diff 只含 `feature-b` 自身的 commits |
 | AC-018 | parent branch 本地已刪、只剩 `origin/feature-a` | 解析 base | base 為 `origin/feature-a` |
+| AC-019 | stack `main ← feature-a ← feature-b ← feature-c`，站在 `feature-b`（child `feature-c` 包含 HEAD） | 解析 base | base 為 `feature-a`；child 不參與 fork-point 計算與標籤 |
 
 ### REQ-004: Session reuse
 

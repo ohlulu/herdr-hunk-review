@@ -79,7 +79,7 @@ place (and focuses it), or — when there is none — the picker pane itself
 
 | Target | Shows |
 |--------|-------|
-| Merge base | `<base>...HEAD` — your branch since it diverged from the base; base resolves via a non-own-tracking `@{u}`, then fork-parent detection (the nearest branch this one was forked from, so stacked branches review against their parent instead of the repo default branch), then `origin/HEAD`, then `main` / `master` / `trunk`; row hidden when nothing resolves |
+| Merge base | `<base>...HEAD` — your branch since it diverged from the base; base resolves via a non-own-tracking `@{u}`, then fork-parent detection (the nearest branch this one was forked from, so stacked branches review against their parent instead of the repo default branch; branches containing `HEAD` — stack children — and the branch's own remote copies are never the base), then `origin/HEAD`, then `main` / `master` / `trunk`; row hidden when nothing resolves |
 | Uncommitted | Staged + unstaged changes vs `HEAD`, live (`--watch`) |
 | Last commit | The `HEAD` commit |
 | Pick commit | fzf over `git log`, view one commit |

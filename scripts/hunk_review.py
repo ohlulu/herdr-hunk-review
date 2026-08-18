@@ -163,24 +163,36 @@ def resolve_review_cwd(context_json, pane_list):
     return None
 
 
-def _split_ref(refname):
+def _split_ref(refname, remotes):
     """Full refname -> (short, branch_part, is_remote), or None to skip.
 
-    branch_part is the name with any remote prefix removed, parsed from the
-    full refname so nested local names (feature/x) never collide with the
-    remote-copy exclusion below."""
+    branch_part strips the remote prefix by longest match against the
+    configured remote names: remote names may themselves contain slashes
+    (`git remote add team/origin` is legal), so a fixed first-segment split
+    would misparse refs/remotes/team/origin/feature-b and let that remote's
+    copy of the current branch escape the own-copy exclusion. Refs under an
+    unconfigured layout fall back to the first-segment split. Parsing the
+    full refname also keeps nested local names (feature/x) out of the
+    remote-copy exclusion."""
     if refname.startswith("refs/heads/"):
         name = refname[len("refs/heads/"):]
         return name, name, False
-    if refname.startswith("refs/remotes/"):
-        rest = refname[len("refs/remotes/"):]
-        if "/" not in rest:
-            return rest, rest, True
-        return rest, rest.split("/", 1)[1], True
-    return None
+    if not refname.startswith("refs/remotes/"):
+        return None
+    rest = refname[len("refs/remotes/"):]
+    prefix = max(
+        (r for r in remotes or [] if rest.startswith(r + "/")),
+        key=len,
+        default=None,
+    )
+    if prefix:
+        return rest, rest[len(prefix) + 1:], True
+    if "/" not in rest:
+        return rest, rest, True
+    return rest, rest.split("/", 1)[1], True
 
 
-def _fork_ref_rows(output, branch):
+def _fork_ref_rows(output, branch, remotes):
     """Parse `for-each-ref` lines into candidate (refname, short, branch_part,
     is_remote, tip) rows.
 
@@ -195,7 +207,7 @@ def _fork_ref_rows(output, branch):
             continue
         refname = parts[0]
         tip = parts[1] if len(parts) > 1 else None
-        split = _split_ref(refname)
+        split = _split_ref(refname, remotes)
         if split is None:
             continue
         short, branch_part, is_remote = split
@@ -215,9 +227,32 @@ def resolve_fork_parent(git, branch):
     feature-a, not the repo default branch. Git records no parent-branch
     metadata, so this walks the first-parent chain to the first commit any
     other branch contains (the fork point), then labels it with the best
-    containing ref. Fixed four git calls regardless of branch count."""
-    out = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
-    candidates = [row[0] for row in _fork_ref_rows(out, branch)]
+    containing ref. Fixed six git calls regardless of branch count.
+
+    Refs that contain HEAD are children of this branch or twins at its tip:
+    they can never be the fork parent, and leaving them in would collapse
+    the fork point to HEAD (a stack's child at our tip made detection bail
+    to the trunk fallback). Both the fork-point race and the labeling drop
+    them. A child forked from a mid-chain commit after this branch advanced
+    is indistinguishable from a parent by reachability alone; the menu row
+    shows whatever won, and an explicit `--set-upstream-to` parent (REQ-003
+    first step) overrides detection entirely."""
+    remotes = (git("remote") or "").splitlines()
+    refs_out = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+    head_holders = git(
+        "for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+        "refs/heads", "refs/remotes",
+    )
+    if not head_holders:
+        # The current branch always contains HEAD, so an empty answer means
+        # the probe failed — and without it a child could pose as parent.
+        return None
+    descendants = set(head_holders.split())
+    candidates = [
+        row[0]
+        for row in _fork_ref_rows(refs_out, branch, remotes)
+        if row[0] not in descendants
+    ]
     if not candidates:
         return None
     count = git("rev-list", "--count", "--first-parent", "HEAD", "--not", *candidates)
@@ -226,7 +261,8 @@ def resolve_fork_parent(git, branch):
     except (TypeError, ValueError):
         return None
     if exclusive == 0:
-        # HEAD is already contained in another branch: empty diff, no parent.
+        # Descendants were excluded above, so this means the candidate set
+        # raced a ref update; treat as no parent rather than guess.
         return None
     fork_point = git("rev-parse", f"HEAD~{exclusive}")
     if not fork_point:
@@ -238,7 +274,11 @@ def resolve_fork_parent(git, branch):
         "--contains", fork_point,
         "refs/heads", "refs/remotes",
     )
-    rows = _fork_ref_rows(containing, branch)
+    rows = [
+        row
+        for row in _fork_ref_rows(containing, branch, remotes)
+        if row[0] not in descendants
+    ]
     if not rows:
         return None
     # An unmoved local parent (tip == fork point) is the branch we forked

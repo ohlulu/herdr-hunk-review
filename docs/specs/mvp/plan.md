@@ -131,10 +131,10 @@ Address each comment and verify the result. If a comment is unclear, ask a focus
 
 ### DEC-013: Fork-parent base detection（2026-08-18）
 
-- Choice: REQ-003 的 base resolution 在非-own-tracking `@{u}` 之後、`origin/HEAD` 之前插入 fork-parent 偵測，固定 4 次 git 呼叫：(1) `for-each-ref` 列候選 refs（排除當前 branch、各 remote 對它的 copy、remote `HEAD` alias；用 full refname 解析，巢狀 local 名稱如 `feature/x` 不會誤比）；(2) `rev-list --count --first-parent HEAD --not <candidates>` 得專屬 commit 數 k；(3) `HEAD~k` = fork point；(4) `for-each-ref --contains <fork-point>` 找含有它的 refs，優先序：tip == fork point（未移動的 parent）> local > conventional（main/master/trunk）> 名稱字序。k == 0（HEAD 被其他 branch 包含，空 diff）或 `HEAD~k` 不存在（全史專屬）→ 回傳 None 走舊 fallback。在 main/master/trunk 或 `origin/HEAD` 目標 branch 上直接跳過偵測（trunk 沒有 parent）。
-- Alternatives: 逐 branch `merge-base` + distance（N 次呼叫，大 repo 慢）；reflog `Created from`（只記 `HEAD`，不可靠）；`merge-base --fork-point`（需先知道 candidate 且依賴 reflog）。
-- Rationale: stacked branch（feature-b 從 feature-a 開出）先前落到 `origin/HEAD`/`main`，diff 把 parent 的 commits 一併捲進來；git 沒有 parent-branch metadata，first-parent 鏈上第一個被其他 branch 包含的 commit 就是 fork point，含有它的 ref 即 parent 候選；排除自身 remote copy 是 AC-006 的廣義化（否則 pushed branch 永遠 diff 到只剩 unpushed commits）。
-- Satisfies: REQ-003 AC-006、AC-017、AC-018。
+- Choice: REQ-003 的 base resolution 在非-own-tracking `@{u}` 之後、`origin/HEAD` 之前插入 fork-parent 偵測，固定 6 次 git 呼叫：(1) `git remote` 取 remote 名單（remote 名可含 `/`，如 `team/origin`，branch 部分以最長 remote prefix 匹配切出，未知 layout 退回第一段切割）；(2) `for-each-ref` 列候選 refs（排除當前 branch、各 remote 對它的 copy、remote `HEAD` alias；用 full refname 解析，巢狀 local 名稱如 `feature/x` 不會誤比）；(3) `for-each-ref --contains HEAD` 找出包含 HEAD 的 refs（stack 的 child、同 tip 雙胞胎），從候選與標籤兩階段都排除 —— 它們不可能是 parent，留著會把 fork point 壓成 HEAD 讓偵測直接收場；探針失敗（當前 branch 必含 HEAD，空答案即失敗）則 fail closed 走 fallback；(4) `rev-list --count --first-parent HEAD --not <candidates>` 得專屬 commit 數 k；(5) `HEAD~k` = fork point；(6) `for-each-ref --contains <fork-point>` 找含有它的 refs，優先序：tip == fork point（未移動的 parent）> local > conventional（main/master/trunk）> 名稱字序。k == 0（候選集與 ref 更新競賽）或 `HEAD~k` 不存在（全史專屬）→ 回傳 None 走舊 fallback。在 main/master/trunk 或 `origin/HEAD` 目標 branch 上直接跳過偵測（trunk 沒有 parent）。
+- Alternatives: 逐 branch `merge-base` + distance（N 次呼叫，大 repo 慢）；reflog `Created from`（只記 `HEAD`，不可靠；且 clone 來的 branch 的 reflog 起點是 clone 當下，非真正創建點）；`merge-base --fork-point`（需先知道 candidate 且依賴 reflog）。
+- Rationale: stacked branch（feature-b 從 feature-a 開出）先前落到 `origin/HEAD`/`main`，diff 把 parent 的 commits 一併捲進來；git 沒有 parent-branch metadata，first-parent 鏈上第一個被其他 branch 包含的 commit 就是 fork point，含有它的 ref 即 parent 候選；排除自身 remote copy 是 AC-006 的廣義化（否則 pushed branch 永遠 diff 到只剩 unpushed commits）；排除含 HEAD 的 refs 是同一邏輯對 child 方向的對稱式（code review 指出的 P1：活的 stack 中 child 常駐 tip，不排除則原 bug 復發）。已知限制：child 從我方鏈中途 commit 開出、我方其後續有新 commit 時，單靠 reachability 無法與 parent 區分（方向資訊只存在於未被記錄的創建事件）；選單標籤會顯示勝出的 ref，使用者可用 branch-vs-branch 或 `--set-upstream-to=<parent>`（REQ-003 第一優先）明確指定。
+- Satisfies: REQ-003 AC-006、AC-017–AC-019。
 
 ## Change Map
 
@@ -149,11 +149,11 @@ Address each comment and verify the result. If a comment is unclear, ask a focus
 
 ## Verification
 
-- `python3 -m unittest discover -s tests` → 純邏輯（base resolution、menu/argv map、agent resolution、prompt format、sent-id filter）全綠。
+- `python3 -m unittest discover -s tests` → 純邏輯（base resolution、menu/argv map、agent resolution、prompt format、sent-id filter）含真實 git 暫存 repo 的 fork-parent integration tests（AC-017–019、slash remote、trunk fallback）全綠。
 - `herdr plugin link ~/Developer/ohlulu/herdr-hunk-review` + `herdr plugin list` → plugin 可見、無 manifest 錯誤。
 - `herdr plugin action invoke review --plugin herdr-hunk-review` → picker pane 開啟（AC-001）；非 git cwd pane 觸發 → AC-002。
 - `hunk diff HEAD` 語義實測：staged-only 變動要出現（DEC-005 note）。
-- 選單六項逐一確認 argv / reload（AC-004..008；用測試 repo 造 upstream-self、無 base 等情境驗 AC-005、AC-006）。
+- 選單六項逐一確認 argv / reload（AC-004..008；用測試 repo 造 upstream-self、無 base、stacked + child、remote-only parent 等情境驗 AC-005、AC-006、AC-017–019）。
 - send 全鏈路：hunk TUI 手動加 note → cmd+shift+s → agent pane 收到 prompt、note 消失、再按一次得 no-new-notes（AC-009、010、014）。
 - `herdr server reload-config` 後 kitty 全鏈路（AC-015、016）。
 

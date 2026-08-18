@@ -1,10 +1,16 @@
-"""Tests for scripts/hunk_review.py (stdlib unittest, no real subprocesses)."""
+"""Tests for scripts/hunk_review.py (stdlib unittest).
+
+Pure-logic tests inject fake runners and never shell out; the
+ResolveForkParentGitIntegrationTests class is the deliberate exception and
+builds real throwaway git repos, because graph-reachability behavior is
+exactly where fake-runner assumptions go wrong."""
 
 import contextlib
 import fcntl
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -183,6 +189,7 @@ class ResolveBaseTests(unittest.TestCase):
 
 
 FORK_SHA = "bb3671a750deba4a775ef59b76ef6f22a2a92523"
+ADVANCED_SHA = "9f2c11d9f2c11d9f2c11d9f2c11d9f2c11d9f2c"
 
 
 class ResolveForkParentTests(unittest.TestCase):
@@ -190,21 +197,89 @@ class ResolveForkParentTests(unittest.TestCase):
     default branch."""
 
     def test_stacked_branch_resolves_fork_parent(self):
+        # AC-017: both branches advanced after the fork, so the parent's tip
+        # no longer equals the fork point and labeling must still find it.
         git = fake_git(
             {
                 ("rev-parse", "--abbrev-ref", "HEAD"): "feature-b",
                 ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
                     "refs/heads/feature-a\nrefs/heads/feature-b\nrefs/heads/main",
+                ("for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+                 "refs/heads", "refs/remotes"): "refs/heads/feature-b",
+                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
+                 "refs/heads/feature-a", "refs/heads/main"): "3",
+                ("rev-parse", "HEAD~3"): FORK_SHA,
+                ("for-each-ref", "--format=%(refname) %(objectname)",
+                 "--contains", FORK_SHA, "refs/heads", "refs/remotes"):
+                    f"refs/heads/feature-a {ADVANCED_SHA}\n"
+                    "refs/heads/feature-b 50680de50680de50680de50680de50680de5068",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "feature-a")
+
+    def test_child_at_tip_is_excluded_from_race_and_labeling(self):
+        # AC-019: a stack's child branch contains HEAD; without the descendant
+        # exclusion it collapses the fork point to HEAD and detection bails to
+        # the trunk fallback (the originally reported bug, reintroduced).
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature-b",
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-a\nrefs/heads/feature-b\n"
+                    "refs/heads/feature-c\nrefs/heads/main",
+                ("for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+                 "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-b\nrefs/heads/feature-c",
                 ("rev-list", "--count", "--first-parent", "HEAD", "--not",
                  "refs/heads/feature-a", "refs/heads/main"): "3",
                 ("rev-parse", "HEAD~3"): FORK_SHA,
                 ("for-each-ref", "--format=%(refname) %(objectname)",
                  "--contains", FORK_SHA, "refs/heads", "refs/remotes"):
                     f"refs/heads/feature-a {FORK_SHA}\n"
-                    "refs/heads/feature-b 50680de50680de50680de50680de50680de5068",
+                    "refs/heads/feature-b 50680de50680de50680de50680de50680de5068\n"
+                    "refs/heads/feature-c 7c33aa17c33aa17c33aa17c33aa17c33aa17c33",
             }
         )
         self.assertEqual(hr.resolve_base(git), "feature-a")
+
+    def test_head_probe_failure_aborts_detection(self):
+        # Without the --contains HEAD answer a child could pose as parent;
+        # fail closed into the fallback chain instead.
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature",
+                ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature\nrefs/heads/main",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "origin/main")
+
+    def test_slash_remote_copy_of_current_branch_is_excluded(self):
+        # `git remote add team/origin …` is legal; the own-copy exclusion must
+        # strip the remote prefix by configured-remote longest match, not by
+        # the first path segment.
+        git = fake_git(
+            {
+                ("rev-parse", "--abbrev-ref", "HEAD"): "feature-b",
+                ("remote",): "team/origin",
+                ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
+                    "refs/heads/feature-b\nrefs/heads/main\n"
+                    "refs/remotes/team/origin/HEAD\n"
+                    "refs/remotes/team/origin/feature-a\n"
+                    "refs/remotes/team/origin/feature-b",
+                ("for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+                 "refs/heads", "refs/remotes"): "refs/heads/feature-b",
+                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
+                 "refs/heads/main", "refs/remotes/team/origin/feature-a"): "2",
+                ("rev-parse", "HEAD~2"): FORK_SHA,
+                ("for-each-ref", "--format=%(refname) %(objectname)",
+                 "--contains", FORK_SHA, "refs/heads", "refs/remotes"):
+                    f"refs/remotes/team/origin/feature-a {FORK_SHA}\n"
+                    "refs/remotes/team/origin/feature-b 50680de50680de50680de50680de50680de5068",
+            }
+        )
+        self.assertEqual(hr.resolve_base(git), "team/origin/feature-a")
 
     def test_remote_only_parent_wins_and_own_remote_copy_is_excluded(self):
         # feature-a deleted locally; origin/feature-b (our own pushed copy)
@@ -215,10 +290,13 @@ class ResolveForkParentTests(unittest.TestCase):
                 ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"):
                     "origin/feature-b",
                 ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
+                ("remote",): "origin",
                 ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
                     "refs/heads/feature-b\nrefs/heads/main\n"
                     "refs/remotes/origin/HEAD\nrefs/remotes/origin/feature-a\n"
                     "refs/remotes/origin/feature-b\nrefs/remotes/origin/main",
+                ("for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+                 "refs/heads", "refs/remotes"): "refs/heads/feature-b",
                 ("rev-list", "--count", "--first-parent", "HEAD", "--not",
                  "refs/heads/main", "refs/remotes/origin/feature-a",
                  "refs/remotes/origin/main"): "4",
@@ -240,8 +318,11 @@ class ResolveForkParentTests(unittest.TestCase):
         )
         git = fake_git(
             {
+                ("remote",): "origin",
                 ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
                     "refs/heads/feature-a\nrefs/heads/main\nrefs/remotes/origin/feature-a",
+                ("for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+                 "refs/heads", "refs/remotes"): "refs/heads/feature-b",
                 ("rev-list", "--count", "--first-parent", "HEAD", "--not",
                  "refs/heads/feature-a", "refs/heads/main",
                  "refs/remotes/origin/feature-a"): "2",
@@ -265,20 +346,134 @@ class ResolveForkParentTests(unittest.TestCase):
 
         self.assertEqual(hr.resolve_base(git), "origin/main")
         self.assertNotIn("for-each-ref", [args[0] for args in calls])
+        self.assertNotIn(("remote",), calls)
 
-    def test_head_contained_in_another_branch_falls_back(self):
-        # Zero exclusive commits -> empty diff -> not a usable parent.
+    def test_all_candidates_contain_head_falls_back(self):
+        # A twin branch at our tip contains HEAD: empty candidate set, no
+        # parent, fall back to origin/HEAD (previously this surfaced as
+        # rev-list counting zero exclusive commits).
         git = fake_git(
             {
                 ("rev-parse", "--abbrev-ref", "HEAD"): "feature",
                 ("rev-parse", "--abbrev-ref", "origin/HEAD"): "origin/main",
                 ("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"):
-                    "refs/heads/feature\nrefs/heads/main",
-                ("rev-list", "--count", "--first-parent", "HEAD", "--not",
-                 "refs/heads/main"): "0",
+                    "refs/heads/feature\nrefs/heads/twin",
+                ("for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+                 "refs/heads", "refs/remotes"):
+                    "refs/heads/feature\nrefs/heads/twin",
             }
         )
         self.assertEqual(hr.resolve_base(git), "origin/main")
+
+
+@unittest.skipUnless(shutil.which("git"), "requires git on PATH")
+class ResolveForkParentGitIntegrationTests(unittest.TestCase):
+    """Real temp-repo graphs. The fake-runner fixtures above encode the
+    author's call-shape assumptions — the child-at-tip bug slipped exactly
+    there — so the graph scenarios also run against actual git."""
+
+    @staticmethod
+    def _git(repo, *args):
+        proc = subprocess.run(
+            ["git", "-C", repo, *args], capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"git {args} failed: {proc.stderr}")
+        return proc.stdout.strip()
+
+    def _repo(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = tmp.name
+        self._git(repo, "init", "-q", "-b", "main")
+        self._git(repo, "config", "user.email", "t@t.t")
+        self._git(repo, "config", "user.name", "t")
+        return repo
+
+    def _commits(self, repo, label, n):
+        for i in range(1, n + 1):
+            self._git(repo, "commit", "--allow-empty", "-qm", f"{label} {i}")
+
+    def _stack(self, repo):
+        """main(2) <- feature-a(2) <- feature-b(3); returns the fork point of
+        feature-b (feature-a's tip at fork time)."""
+        self._commits(repo, "main", 2)
+        self._git(repo, "checkout", "-qb", "feature-a")
+        self._commits(repo, "fa", 2)
+        fork_point = self._git(repo, "rev-parse", "HEAD")
+        self._git(repo, "checkout", "-qb", "feature-b")
+        self._commits(repo, "fb", 3)
+        return fork_point
+
+    def _runner(self, repo):
+        return lambda *args: hr._run(["git", "-C", repo, *args])
+
+    def test_stacked_branch_with_advanced_parent(self):
+        # AC-017: both branches advanced after the fork; the diff base must
+        # stay the fork point, keeping parent commits out of the review.
+        repo = self._repo()
+        fork_point = self._stack(repo)
+        self._git(repo, "checkout", "-q", "feature-a")
+        self._commits(repo, "fa-later", 1)
+        self._git(repo, "checkout", "-q", "feature-b")
+        self.assertEqual(hr.resolve_base(self._runner(repo)), "feature-a")
+        self.assertEqual(
+            self._git(repo, "merge-base", "feature-a", "HEAD"), fork_point
+        )
+
+    def test_stack_child_at_tip_is_not_the_base(self):
+        # AC-019: main <- a <- b <- c, standing on b. The child c contains
+        # HEAD; before the descendant exclusion this collapsed detection and
+        # fell back to main (the originally reported bug).
+        repo = self._repo()
+        self._stack(repo)
+        self._git(repo, "checkout", "-qb", "feature-c")
+        self._commits(repo, "fc", 2)
+        self._git(repo, "checkout", "-q", "feature-b")
+        self.assertEqual(hr.resolve_base(self._runner(repo)), "feature-a")
+
+    def test_remote_only_parent(self):
+        # AC-018: parent deleted locally, only origin/feature-a remains.
+        repo = self._repo()
+        self._stack(repo)
+        bare = tempfile.TemporaryDirectory()
+        self.addCleanup(bare.cleanup)
+        subprocess.run(
+            ["git", "init", "-q", "--bare", bare.name],
+            check=True, capture_output=True,
+        )
+        self._git(repo, "remote", "add", "origin", bare.name)
+        self._git(repo, "push", "-q", "origin", "main", "feature-a", "feature-b")
+        self._git(repo, "branch", "-q", "--set-upstream-to=origin/feature-b")
+        self._git(repo, "branch", "-qD", "feature-a")
+        self._commits(repo, "fb-unpushed", 1)
+        self.assertEqual(hr.resolve_base(self._runner(repo)), "origin/feature-a")
+
+    def test_slash_remote_copy_of_current_branch_is_excluded(self):
+        # A remote literally named team/origin: first-segment parsing would
+        # read its feature-b copy as branch "origin/feature-b" and let it win
+        # the fork race, shrinking the diff to the unpushed commits.
+        repo = self._repo()
+        self._stack(repo)
+        bare = tempfile.TemporaryDirectory()
+        self.addCleanup(bare.cleanup)
+        subprocess.run(
+            ["git", "init", "-q", "--bare", bare.name],
+            check=True, capture_output=True,
+        )
+        self._git(repo, "remote", "add", "team/origin", bare.name)
+        self._git(repo, "push", "-q", "team/origin", "feature-a", "feature-b")
+        self._git(repo, "branch", "-qD", "feature-a")
+        self._commits(repo, "fb-unpushed", 1)
+        self.assertEqual(
+            hr.resolve_base(self._runner(repo)), "team/origin/feature-a"
+        )
+
+    def test_trunk_branch_keeps_fallback(self):
+        repo = self._repo()
+        self._stack(repo)
+        self._git(repo, "checkout", "-q", "main")
+        self.assertEqual(hr.resolve_base(self._runner(repo)), "main")
 
 
 class BuildMenuTests(unittest.TestCase):
