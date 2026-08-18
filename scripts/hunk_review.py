@@ -163,12 +163,147 @@ def resolve_review_cwd(context_json, pane_list):
     return None
 
 
+def _split_ref(refname, remotes):
+    """Full refname -> (short, branch_part, is_remote), or None to skip.
+
+    branch_part strips the remote prefix by longest match against the
+    configured remote names: remote names may themselves contain slashes
+    (`git remote add team/origin` is legal), so a fixed first-segment split
+    would misparse refs/remotes/team/origin/feature-b and let that remote's
+    copy of the current branch escape the own-copy exclusion. Refs under an
+    unconfigured layout fall back to the first-segment split. Parsing the
+    full refname also keeps nested local names (feature/x) out of the
+    remote-copy exclusion."""
+    if refname.startswith("refs/heads/"):
+        name = refname[len("refs/heads/"):]
+        return name, name, False
+    if not refname.startswith("refs/remotes/"):
+        return None
+    rest = refname[len("refs/remotes/"):]
+    prefix = max(
+        (r for r in remotes or [] if rest.startswith(r + "/")),
+        key=len,
+        default=None,
+    )
+    if prefix:
+        return rest, rest[len(prefix) + 1:], True
+    if "/" not in rest:
+        return rest, rest, True
+    return rest, rest.split("/", 1)[1], True
+
+
+def _fork_ref_rows(output, branch, remotes):
+    """Parse `for-each-ref` lines into candidate (refname, short, branch_part,
+    is_remote, tip) rows.
+
+    Skips the current branch, every remote's copy of it (their history is our
+    own, so they would win the fork-point race and shrink the diff to the
+    unpushed commits, AC-006), and remote HEAD alias rows. tip is None when
+    the format carried no objectname column."""
+    rows = []
+    for line in (output or "").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        refname = parts[0]
+        tip = parts[1] if len(parts) > 1 else None
+        split = _split_ref(refname, remotes)
+        if split is None:
+            continue
+        short, branch_part, is_remote = split
+        if branch_part == "HEAD" or (branch and branch_part == branch):
+            continue
+        rows.append((refname, short, branch_part, is_remote, tip))
+    return rows
+
+
+CONVENTIONAL_BRANCHES = ("main", "master", "trunk")
+
+
+def resolve_fork_parent(git, branch):
+    """Nearest branch this branch was forked from, or None.
+
+    Stacked branches (feature-b forked from feature-a) must review against
+    feature-a, not the repo default branch. Git records no parent-branch
+    metadata, so this walks the first-parent chain to the first commit any
+    other branch contains (the fork point), then labels it with the best
+    containing ref. Fixed six git calls regardless of branch count.
+
+    Refs that contain HEAD are children of this branch or twins at its tip:
+    they can never be the fork parent, and leaving them in would collapse
+    the fork point to HEAD (a stack's child at our tip made detection bail
+    to the trunk fallback). Both the fork-point race and the labeling drop
+    them. A child forked from a mid-chain commit after this branch advanced
+    is indistinguishable from a parent by reachability alone; the menu row
+    shows whatever won, and an explicit `--set-upstream-to` parent (REQ-003
+    first step) overrides detection entirely."""
+    remotes = (git("remote") or "").splitlines()
+    refs_out = git("for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+    head_holders = git(
+        "for-each-ref", "--format=%(refname)", "--contains", "HEAD",
+        "refs/heads", "refs/remotes",
+    )
+    if not head_holders:
+        # The current branch always contains HEAD, so an empty answer means
+        # the probe failed — and without it a child could pose as parent.
+        return None
+    descendants = set(head_holders.split())
+    candidates = [
+        row[0]
+        for row in _fork_ref_rows(refs_out, branch, remotes)
+        if row[0] not in descendants
+    ]
+    if not candidates:
+        return None
+    count = git("rev-list", "--count", "--first-parent", "HEAD", "--not", *candidates)
+    try:
+        exclusive = int(count)
+    except (TypeError, ValueError):
+        return None
+    if exclusive == 0:
+        # Descendants were excluded above, so this means the candidate set
+        # raced a ref update; treat as no parent rather than guess.
+        return None
+    fork_point = git("rev-parse", f"HEAD~{exclusive}")
+    if not fork_point:
+        # Entire history is exclusive (unrelated branches, shallow clone).
+        return None
+    containing = git(
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "--contains", fork_point,
+        "refs/heads", "refs/remotes",
+    )
+    rows = [
+        row
+        for row in _fork_ref_rows(containing, branch, remotes)
+        if row[0] not in descendants
+    ]
+    if not rows:
+        return None
+    # An unmoved local parent (tip == fork point) is the branch we forked
+    # from, verbatim; conventional trunks beat siblings that merely contain
+    # the fork point; locals beat their remote copies.
+    best = min(
+        rows,
+        key=lambda row: (
+            0 if row[4] == fork_point else 1,
+            1 if row[3] else 0,
+            0 if row[2] in CONVENTIONAL_BRANCHES else 1,
+            row[1],
+        ),
+    )
+    return best[1]
+
+
 def resolve_base(git):
     """Merge-base ref for the review menu (REQ-003), or None.
 
     `git` is an injected runner: git(*args) -> stripped stdout, None on failure.
-    `@{u}` is skipped when it is the current branch's own remote-tracking ref,
-    which would diff to nothing (AC-006)."""
+    Order: explicit non-own-tracking upstream, fork-parent detection (skipped
+    on conventional trunk branches, which have no parent), origin/HEAD, then
+    conventional names. `@{u}` is skipped when it is the current branch's own
+    remote-tracking ref, which would diff to nothing (AC-006)."""
     branch = git("rev-parse", "--abbrev-ref", "HEAD")
     upstream = git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
     if upstream:
@@ -178,9 +313,19 @@ def resolve_base(git):
         if not own_tracking:
             return upstream
     origin_head = git("rev-parse", "--abbrev-ref", "origin/HEAD")
+    on_trunk = branch in CONVENTIONAL_BRANCHES or (
+        branch
+        and origin_head
+        and "/" in origin_head
+        and origin_head.split("/", 1)[1] == branch
+    )
+    if branch and not on_trunk:
+        fork_parent = resolve_fork_parent(git, branch)
+        if fork_parent:
+            return fork_parent
     if origin_head:
         return origin_head
-    for name in ("main", "master", "trunk"):
+    for name in CONVENTIONAL_BRANCHES:
         if git("rev-parse", "--verify", "--quiet", name) is not None:
             return name
     return None
@@ -354,28 +499,37 @@ def pick_commit_sha():
     return selected.split()[0]
 
 
-def pick_range_shas():
-    """(old, new) shas from up to two marks; (sha, None) for a single mark.
+WORKTREE_ROW = "(worktree)"
 
-    Order is derived from log position (git log is newest-first, DEC-006:
-    diff old..new), not from fzf's mark output order."""
+
+def pick_range_shas():
+    """(old, new) shas via two fzf rounds; (old, None) means old..worktree.
+
+    Round one picks the old end over the full log; round two lists only
+    commits newer than it (log is newest-first) plus a leading `(worktree)`
+    row as the default, so the range is old..new by construction. The
+    original single-round `--multi 2` flow required knowing fzf's Tab
+    marking, and Enter with one mark silently launched the single-commit
+    fallback — which read as 'cannot select the second commit'."""
     lines = git_log_lines()
     if not lines:
         return None
-    selected = run_fzf(lines, "--ansi", "--multi", "2")
-    if selected is None:
+    old_line = run_fzf(lines, "--ansi", "--prompt", "old> ")
+    if old_line is None:
         return None
-    shas = [line.split()[0] for line in selected.splitlines()]
-    if len(shas) == 1:
-        return shas[0], None
-    if len(shas) != 2:
-        return None
+    # fzf --ansi strips color codes from the output line, so field 0 is the sha.
+    old = old_line.split()[0]
     log_order = [strip_ansi(line).split()[0] for line in lines]
     try:
-        older_first = sorted(shas, key=log_order.index, reverse=True)
+        newer = lines[: log_order.index(old)]
     except ValueError:
         return None
-    return older_first[0], older_first[1]
+    new_line = run_fzf([WORKTREE_ROW, *newer], "--ansi", "--prompt", "new> ")
+    if new_line is None:
+        return None
+    if new_line == WORKTREE_ROW:
+        return old, None
+    return old, new_line.split()[0]
 
 
 def pick_branches():
