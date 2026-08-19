@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.0] - 2026-08-18
+## [0.4.0] - 2026-08-19
 
 Breaking: the plugin id changed from `herdr-hunk-review` to `herdr-review`.
 Update the `command` in your `~/.config/herdr/config.toml` keybindings to
