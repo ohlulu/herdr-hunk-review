@@ -54,6 +54,18 @@ class StateIOTests(StateDirTestCase):
         (self.state_dir / "sent.json").write_text("{not json", encoding="utf-8")
         self.assertEqual(hr.read_json_state("sent.json", {"d": 1}), {"d": 1})
 
+    def test_strict_missing_file_still_returns_default(self):
+        # Absence is a legitimate fresh state, even in strict mode.
+        self.assertEqual(hr.read_json_state("sent.json", {}, strict=True), {})
+
+    def test_strict_corrupt_file_raises_state_error(self):
+        # sent.json is the only duplicate guard: a corrupt file must not
+        # read as empty history (fail closed).
+        (self.state_dir / "sent.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaises(hr.StateError) as ctx:
+            hr.read_json_state("sent.json", {}, strict=True)
+        self.assertIn("sent.json", str(ctx.exception))
+
     def test_write_then_read_roundtrip(self):
         data = {"repo": "pane-1", "ids": ["a", "b"], "n": 3}
         hr.write_json_state("panes.json", data)
@@ -625,10 +637,17 @@ class PickRangeTests(unittest.TestCase):
         result, _ = self._run(["bbb222 middle commit", hr.WORKTREE_ROW])
         self.assertEqual(result, ("bbb222", None))
 
-    def test_newest_old_offers_only_worktree(self):
+    def test_newest_old_offers_only_worktree_and_collapses(self):
+        # Regression: `<tip>..HEAD` is an empty commit range tuicr rejects
+        # even with -w, so a tip old end with the worktree row must signal
+        # worktree-only instead of mapping to `tuicr -r <tip>..HEAD -w`.
         result, calls = self._run(["ccc333 newest commit", hr.WORKTREE_ROW])
-        self.assertEqual(result, ("ccc333", None))
+        self.assertEqual(result, (None, None))
         self.assertEqual(calls[1][0], [hr.WORKTREE_ROW])
+
+    def test_tip_to_worktree_pick_maps_to_uncommitted_argv(self):
+        with mock.patch.object(hr, "pick_range_shas", return_value=(None, None)):
+            self.assertEqual(hr.pick_target("pick-range", None), ["tuicr", "-w"])
 
     def test_cancel_in_first_round_returns_none(self):
         result, calls = self._run([None])
@@ -805,6 +824,25 @@ class FormatPromptTests(unittest.TestCase):
                               content="Simplify this block.")]
         self.assertIn("- lib/util.py:10-14 — Simplify this block.",
                       hr.format_prompt("/r", notes))
+
+    def test_old_side_comment_keeps_old_marker(self):
+        # A deleted-line comment carries pre-change coordinates; dropping
+        # tuicr's `[old]` marker would point the agent at the wrong line.
+        notes = [self.comment(path="a.py", start_line=3, end_line=3,
+                              side="old", content="Why was this removed?")]
+        self.assertIn("- a.py:3 [old] — Why was this removed?",
+                      hr.format_prompt("/r", notes))
+
+    def test_old_side_range_comment_keeps_old_marker(self):
+        notes = [self.comment(path="a.py", start_line=10, end_line=14,
+                              side="old", content="Dead block.")]
+        self.assertIn("- a.py:10-14 [old] — Dead block.",
+                      hr.format_prompt("/r", notes))
+
+    def test_new_side_comment_has_no_marker(self):
+        notes = [self.comment(path="a.py", start_line=3, end_line=3,
+                              side="new", content="Tighten.")]
+        self.assertIn("- a.py:3 — Tighten.", hr.format_prompt("/r", notes))
 
     def test_comment_type_is_tagged(self):
         notes = [self.comment(path="a.py", start_line=3, end_line=3,
@@ -1096,6 +1134,23 @@ class SendNotesTests(StateDirTestCase):
         self.assertEqual([c for c in record2 if c[0] == "paste"], [])
         notifications2 = [c[3] for c in record2 if c[:3] == ("herdr", "notification", "show")]
         self.assertIn("No new notes to send", notifications2)
+
+    def test_corrupt_sent_state_fails_closed_without_paste(self):
+        # A corrupt sent.json is the loss of the only duplicate guard
+        # (AC-014): abort loudly instead of re-delivering history.
+        (self.state_dir / "sent.json").write_text("{not json", encoding="utf-8")
+        record = []
+        herdr = make_fake_herdr(record, self.AGENTS, {"left": "w1:pAGENT"})
+        tuicr = make_fake_tuicr(record, self.SESSIONS, self.COMMENTS)
+        rc = self.run_send(record, herdr, tuicr)
+        self.assertEqual(rc, 1)
+        self.assertEqual([c for c in record if c[0] == "paste"], [])
+        notifications = [c[3] for c in record if c[:3] == ("herdr", "notification", "show")]
+        self.assertTrue(any("sent.json" in n for n in notifications))
+        # The corrupt file stays in place for inspection, not overwritten.
+        self.assertEqual(
+            (self.state_dir / "sent.json").read_text(encoding="utf-8"), "{not json"
+        )
 
     def test_published_comments_are_not_sent(self):
         # Forge-published comments are not the human's local draft notes.

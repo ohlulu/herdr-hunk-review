@@ -27,6 +27,14 @@ plugin, then `herdr server reload-config`.
   returning to a target restores its comments and reviewed state
 - Notes written before a viewer was closed are still sendable: the plugin
   prefers the running session and falls back to the most recent one
+- Pick range with the newest commit as the old end and `(worktree)` as the
+  new end now opens the worktree diff instead of failing — `<tip>..HEAD` is
+  an empty commit range tuicr rejects with `No changes to review`
+- Deleted-line comments keep tuicr's `[old]` marker in the draft
+  (`path:12 [old]`), so pre-change line numbers are not read as current-file
+  lines
+- A corrupt or unreadable `sent.json` now aborts send-notes with a
+  notification instead of silently re-delivering every historical comment
 
 ## [0.3.0] - 2026-08-18
 

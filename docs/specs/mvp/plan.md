@@ -72,9 +72,10 @@ id = "send-notes"
 | Pick commit | `tuicr -r <sha>` |
 | Pick range | `tuicr -r <old>..<new>` |
 | Pick range（單標記，至工作樹） | `tuicr -r <old>..HEAD -w` |
+| Pick range（單標記=tip，至工作樹） | `tuicr -w`（塌回 Uncommitted） |
 | Branch vs branch | `tuicr -r <base>...<compare>` |
 
-- Rationale: tuicr 用單一 `-r <revset>` 取代 hunk 的 diff/show 動詞，且 revset 直接吃 git 的三點/兩點語法，映射是一對一的。`-w` 單獨用時是 uncommitted，搭 `-r` 時是「把範圍延伸到工作樹」—— 對應 hunk 時代 `hunk diff <old>`（單邊界 = 比到工作樹）的語意。
+- Rationale: tuicr 用單一 `-r <revset>` 取代 hunk 的 diff/show 動詞，且 revset 直接吃 git 的三點/兩點語法，映射是一對一的。`-w` 單獨用時是 uncommitted，搭 `-r` 時是「把範圍延伸到工作樹」—— 對應 hunk 時代 `hunk diff <old>`（單邊界 = 比到工作樹）的語意。例外（2026-08-19）：old 即為 tip 時 `<old>..HEAD` 是空 commit range，tuicr 帶著 `-w` 也照樣拒絕（`No changes to review`），picker 將此選擇塌回 Uncommitted 的 argv。
 - Satisfies: REQ-002、REQ-004、REQ-005。
 
 ### DEC-016: Uncommitted 失去 watch（2026-08-18）
@@ -99,7 +100,7 @@ id = "send-notes"
 ### DEC-008: Sent-id state per tuicr session slug（2026-08-18 改寫）
 
 - Choice: `state/sent.json`，shape `{ "<tuicr-session-slug>": ["<comment-id>", ...] }`。send 流程：`tuicr review list --repo <repo>` → 挑 session（DEC-018）→ `tuicr review comments --session <slug> --repo <repo>` → 過濾 `lifecycle_state == "local_draft"`（DEC-019）→ 過濾已送 id → paste 成功後 markSent → 用 `tuicr review list --all` 的 slug 集合 GC 死 entry。
-- Rationale: comment 隨 session 檔持久化，以 slug 為 key 讓 state 生命週期與 comment 一致。GC 必須用 `--all`：`--repo` 只列單一 checkout，拿它做 GC 會誤刪其他 repo 的已送記錄（hunk 的 `session list` 是全域的，語意不同）。
+- Rationale: comment 隨 session 檔持久化，以 slug 為 key 讓 state 生命週期與 comment 一致。GC 必須用 `--all`：`--repo` 只列單一 checkout，拿它做 GC 會誤刪其他 repo 的已送記錄（hunk 的 `session list` 是全域的，語意不同）。讀取 fail-closed（2026-08-19）：sent.json 不存在 → 空 state；存在但損壞/不可讀 → 中止 send 並通知（當空 state 用等於失去唯一防線，會重送全部歷史）。panes.json 維持 lenient：best-effort cache，損壞下次寫入自癒。
 - Satisfies: REQ-008。
 
 ### DEC-009: Agent resolution implementation
@@ -183,7 +184,7 @@ Address each comment and verify the result. If a comment is unclear, ask a focus
 
 ### DEC-020: Prompt 行號與分型（2026-08-18）
 
-- Choice: `start_line == end_line` → `path:12`；不同 → `path:10-14`；無 `start_line`（file 層級）→ 只有 path；無 path（review 層級）→ `(review)`。`comment_type` 非 `none` 時前置 `[type] `。
+- Choice: `start_line == end_line` → `path:12`；不同 → `path:10-14`；無 `start_line`（file 層級）→ 只有 path；無 path（review 層級）→ `(review)`。`comment_type` 非 `none` 時前置 `[type] `。side 為 old（刪除行，行號屬變更前檔案）→ 尾綴 ` [old]`，與 tuicr 自身的 location 渲染一致（2026-08-19）。
 - Rationale: tuicr 帶真正的 range（hunk 沒有，舊實作只能取 `newRange[0]` 塌成單行），不把它傳給 agent 等於丟掉新能力；nit / issue / question 的分型直接影響 agent 該花多少力氣，值得一併帶上。
 - Satisfies: REQ-006 AC-020。
 

@@ -1,8 +1,7 @@
 ---
-summary: Task breakdown for the herdr-review MVP (machine phases T001-T017 + Human Acceptance)
+summary: Historical task breakdown that built the MVP against the hunk viewer (superseded by the tuicr swap; requirements and plan hold current behavior)
 read_when:
-  - Executing the MVP implementation
-  - Checking implementation progress or what remains
+  - Reading how the MVP was originally sequenced, built, and accepted
 ---
 
 # Tasks: herdr-review MVP

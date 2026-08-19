@@ -40,7 +40,7 @@ The picker SHALL list review targets in this order — merge base, uncommitted, 
 | Uncommitted | staged + unstaged 相對 HEAD 的全部變動，snapshot（tuicr 無 watch 模式） |
 | Last commit | HEAD 這個 commit |
 | Pick commit | fzf 瀏覽 `git log` 選一個 commit |
-| Pick range | 兩輪 fzf：`old>` 選範圍舊端，`new>` 只列比 old 新的 commits 加首列 `(worktree)`（預設，選它則 diff old 至工作樹），diff `old..new` |
+| Pick range | 兩輪 fzf：`old>` 選範圍舊端，`new>` 只列比 old 新的 commits 加首列 `(worktree)`（預設，選它則 diff old 至工作樹），diff `old..new`；old 為最新 commit 時選 `(worktree)` 等同 Uncommitted |
 | Branch vs branch | 兩輪 fzf：先選 base branch，再選 compare branch，diff `base...compare` |
 
 ### REQ-003: Base resolution
@@ -85,6 +85,7 @@ WHEN the user invokes the `send-notes` action (cmd+shift+s), the plugin SHALL pa
 | AC-011 | 該 repo 無任何 tuicr session | 觸發 send-notes | notification 說明無 session，不碰 agent pane |
 | AC-020 | comment 跨 L10–L14（visual mode 建立） | 觸發 send-notes | draft 該列為 `path:10-14 — …`，範圍不塌成單行 |
 | AC-021 | comment 已 publish 到 forge（非 local draft） | 觸發 send-notes | 該則不進 draft |
+| AC-023 | comment 落在刪除行（tuicr side=old） | 觸發 send-notes | draft 該列帶 ` [old]` 尾綴（如 `path:12 [old]`），行號不被誤讀為新檔行號 |
 
 ### REQ-007: Agent target resolution
 
@@ -97,12 +98,13 @@ The plugin SHALL resolve the receiving agent in this order: (1) the focused pane
 
 ### REQ-008: Duplicate suppression
 
-The plugin SHALL record delivered comment ids per tuicr session slug, SHALL exclude recorded ids from later sends, and SHALL drop records whose session no longer exists.
+The plugin SHALL record delivered comment ids per tuicr session slug, SHALL exclude recorded ids from later sends, and SHALL drop records whose session no longer exists. When the sent-id log exists but cannot be read or parsed, the plugin SHALL abort the send with a notification instead of treating it as empty (fail closed).
 
 | AC | Given | When | Then |
 |----|-------|------|------|
 | AC-014 | comment A 已送出且仍在 tuicr 裡（tuicr 無 CLI 刪除） | 再次觸發 send-notes | A 不重送（notification 為 no new notes 或僅含其他新 comment） |
 | AC-022 | 兩個 tuicr session 都有未送 comment，其一 viewer 正在執行 | 觸發 send-notes | 取執行中那個 session；皆未執行時取最近更新的，且 notification 註明 `from closed session <slug>` |
+| AC-024 | sent.json 存在但損壞或不可讀 | 觸發 send-notes | 中止並通知（訊息含檔案路徑）；不 paste、不覆寫該檔 |
 
 ### REQ-009: Keybinding wiring
 

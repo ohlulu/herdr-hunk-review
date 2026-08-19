@@ -44,12 +44,30 @@ def state_dir():
     return path
 
 
-def read_json_state(name, default):
-    """Read state file `name`; a missing or corrupt file yields `default`."""
+class StateError(Exception):
+    """A strict state file exists but cannot be read or parsed."""
+
+
+def read_json_state(name, default, strict=False):
+    """Read state file `name`; a missing file yields `default`.
+
+    A corrupt or unreadable file also yields `default` unless `strict`.
+    Strict is for state whose loss silently changes behavior: sent.json is
+    the only duplicate guard (AC-014), so reading a corrupt file as empty
+    history would re-deliver every recorded comment. Best-effort caches
+    (panes.json) stay lenient — losing one self-heals on the next write."""
+    path = state_dir() / name
     try:
-        with open(state_dir() / name, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError) as error:
+        if strict:
+            raise StateError(
+                f"state file {path} is corrupt or unreadable ({error}); "
+                "fix or remove it, then retry"
+            ) from error
         return default
 
 
@@ -445,10 +463,11 @@ def format_prompt(worktree, comments):
     """DEC-010 fixed English template; one `path:lines — content` row per comment.
 
     tuicr carries real ranges, so a multi-line comment renders `path:10-14`
-    rather than collapsing to its first line. A file-level comment has no
-    lines, a review-level comment has no path, and a classified comment keeps
-    its `[type]` tag so the agent sees nit vs issue (DEC-020). Multi-line
-    bodies pass through verbatim."""
+    rather than collapsing to its first line. An old-side comment (a deleted
+    line — its numbers are pre-change coordinates) keeps tuicr's `[old]`
+    marker. A file-level comment has no lines, a review-level comment has no
+    path, and a classified comment keeps its `[type]` tag so the agent sees
+    nit vs issue (DEC-020). Multi-line bodies pass through verbatim."""
     lines = [f"Human inline review comments on your changes in {worktree}:", ""]
     for comment in comments:
         location = comment.get("path") or "(review)"
@@ -457,6 +476,11 @@ def format_prompt(worktree, comments):
         if start is not None:
             span = f"{start}-{end}" if end is not None and end != start else f"{start}"
             location = f"{location}:{span}"
+            if comment.get("side") == "old":
+                # Same rendering as tuicr's own `location` field: without the
+                # marker the agent would chase a new-file line that never
+                # held this comment.
+                location += " [old]"
         kind = comment.get("comment_type")
         tag = f"[{kind}] " if kind and kind != "none" else ""
         lines.append(f"- {location} — {tag}{comment.get('content', '')}")
@@ -545,7 +569,8 @@ WORKTREE_ROW = "(worktree)"
 
 
 def pick_range_shas():
-    """(old, new) shas via two fzf rounds; (old, None) means old..worktree.
+    """(old, new) shas via two fzf rounds; (old, None) means old..worktree
+    and (None, None) means the old end was the tip: worktree-only (DEC-005).
 
     Round one picks the old end over the full log; round two lists only
     commits newer than it (log is newest-first) plus a leading `(worktree)`
@@ -570,6 +595,10 @@ def pick_range_shas():
     if new_line is None:
         return None
     if new_line == WORKTREE_ROW:
+        if old == log_order[0]:
+            # Old end is the tip: `<tip>..HEAD` is an empty commit range that
+            # tuicr rejects even with -w, so only the worktree remains.
+            return None, None
         return old, None
     return old, new_line.split()[0]
 
@@ -595,7 +624,7 @@ def pick_branches():
 
 
 def pick_target(key, base):
-    """Sub-picker flow for a menu key -> (exec_argv, reload_args) or None."""
+    """Sub-picker flow for a menu key -> exec argv or None."""
     if key == "merge-base":
         return target_argv("merge-base", base=base)
     if key == "uncommitted":
@@ -612,6 +641,9 @@ def pick_target(key, base):
         if pair is None:
             return None
         old, new = pair
+        if old is None:
+            # Tip-to-worktree pick collapses to the Uncommitted argv.
+            return target_argv("uncommitted")
         return target_argv("pick-range", old=old, new=new)
     if key == "branch-vs-branch":
         pair = pick_branches()
@@ -847,7 +879,11 @@ def cmd_send_notes(args):
     if comments is None:
         return fail_action("herdr-review: failed to read tuicr review comments")
 
-    sent = read_json_state(SENT_STATE, {})
+    try:
+        # Fail closed: an unreadable sent record is not an empty history.
+        sent = read_json_state(SENT_STATE, {}, strict=True)
+    except StateError as error:
+        return fail_action(f"herdr-review: {error}")
     unsent = filter_unsent(comments, sent.get(slug, []))
     if not unsent:
         run_herdr("notification", "show", "No new notes to send")  # AC-010

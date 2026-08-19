@@ -104,9 +104,10 @@ Enter yourself. A notification reports
 says so and the agent pane is untouched.
 
 Each row is `path:lines — [type] content`: a range comment keeps both bounds
-(`src/main.rs:10-14`), a file comment has no line suffix, a review-level
-comment shows as `(review)`, and a classification (`nit`, `issue`, …) is
-tagged inline.
+(`src/main.rs:10-14`), a deleted-line comment keeps tuicr's `[old]` marker
+(`src/main.rs:12 [old]` — the numbers are pre-change coordinates), a file
+comment has no line suffix, a review-level comment shows as `(review)`, and a
+classification (`nit`, `issue`, …) is tagged inline.
 
 Pasted counts as delivered: discarding the draft in the composer does not put
 the notes back — they are already recorded in `sent.json`.
@@ -128,7 +129,9 @@ Agent resolution order:
 Delivered comment ids are recorded per tuicr session slug (`sent.json` in the
 plugin state dir). tuicr has no CLI delete, so comments stay in the viewer as
 your review record and this log is what prevents a second delivery. Records for
-sessions that no longer exist are garbage-collected on the next send.
+sessions that no longer exist are garbage-collected on the next send. If the
+log exists but cannot be parsed, send-notes aborts with a notification instead
+of re-delivering history — fix or remove the file, then retry.
 
 The plugin picks the running viewer's session; with none running it falls back
 to the most recently updated session for the repository, so comments written
